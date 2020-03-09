@@ -1,11 +1,15 @@
-pub mod hnsw;
+mod hnsw;
+mod types;
 
 #[macro_use]
 extern crate redis_module;
 
 use redis_module::{parse_integer, Context, RedisError, RedisResult};
+use hnsw::HNSWRedisMode;
 
-fn hello_mul(_: &Context, args: Vec<String>) -> RedisResult {
+static PREFIX: &'static str = "hnsw";
+
+fn example(_: &Context, args: Vec<String>) -> RedisResult {
     if args.len() < 2 {
         return Err(RedisError::WrongArity);
     }
@@ -20,12 +24,41 @@ fn hello_mul(_: &Context, args: Vec<String>) -> RedisResult {
     Ok(response.into())
 }
 
+fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
+    if args.len() < 3 {
+        return Err(RedisError::WrongArity);
+    }
+
+    let index_name = format!("{}.{}", PREFIX, &args[1]);
+    let index_mode = match args[2].as_str() {
+        "source" => HNSWRedisMode::Source,
+        "storage" => HNSWRedisMode::Storage,
+        _ => return Err(RedisError::Str("Invalid HNSW Redis Mode, expected \"source\" or \"storage\"")),
+    };
+    let index_nodes = format!("{}.{}", index_name, "nodeset");
+
+    ctx.auto_memory();
+    match ctx.call("SADD", &[&index_nodes, "zero_entry"]) {
+        Err(RedisError::String(s)) => {
+            return Err(RedisError::String(s))
+        }
+        _ => ()
+    }
+
+    ctx.log_debug(format!("{} is using redis as: {:?}", index_name, index_mode).as_str());
+
+    Ok(index_name.into())
+}
+
 redis_module! {
     name: "hnsw",
     version: 1,
     data_types: [],
     commands: [
-        ["hnsw.new", hello_mul, ""],
+        ["hello.mul", example, ""],
+        ["hnsw.new", new_index, ""],
+        ["hnsw.node.set", types::hnsw_node_set, ""],
+        ["hnsw.node.get", types::hnsw_node_get, ""],
     ],
 }
 
