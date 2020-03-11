@@ -30,20 +30,16 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     }
 
     let index_name = format!("{}.{}", PREFIX, &args[1]);
-    let index_mode = match args[2].as_str() {
-        "source" => HNSWRedisMode::Source,
-        "storage" => HNSWRedisMode::Storage,
-        _ => return Err(RedisError::Str("Invalid HNSW Redis Mode, expected \"source\" or \"storage\"")),
+    let index_mode = match args[2].to_uppercase().as_str() {
+        "SOURCE" => HNSWRedisMode::Source,
+        "STORAGE" => HNSWRedisMode::Storage,
+        _ => return Err(RedisError::Str("Invalid HNSW Redis Mode, expected \"SOURCE\" or \"STORAGE\"")),
     };
     let index_nodes = format!("{}.{}", index_name, "nodeset");
 
     ctx.auto_memory();
-    match ctx.call("SADD", &[&index_nodes, "zero_entry"]) {
-        Err(RedisError::String(s)) => {
-            return Err(RedisError::String(s))
-        }
-        _ => ()
-    }
+    ctx.call("HSET", &[&index_name, "redis_mode", index_mode.to_string().as_str()])?;
+    ctx.call("SADD", &[&index_nodes, "zero_entry"])?;
 
     ctx.log_debug(format!("{} is using redis as: {:?}", index_name, index_mode).as_str());
 
