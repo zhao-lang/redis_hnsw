@@ -4,6 +4,18 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+pub type MetricFuncT = fn(&Vec<f32>, &Vec<f32>, usize) -> f32;
+
+pub fn euclidean(v1: &Vec<f32>, v2: &Vec<f32>, n: usize) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return sim_func_avx_euc(v1, v2, n);
+        }
+    }
+    sim_func_euc(v1, v2, n)
+}
+
 fn hsum_ps_sse3(v: __m128) -> f32 {
     unsafe {
         let mut shuf: __m128 = _mm_movehdup_ps(v); // broadcast elements 3,1 to 2,0
