@@ -4,6 +4,11 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[derive(Copy, Clone, Debug)]
+pub enum MetricFuncs {
+    Euclidean,
+}
+
 pub type MetricFuncT = fn(&Vec<f32>, &Vec<f32>, usize) -> f32;
 
 pub fn euclidean(v1: &Vec<f32>, v2: &Vec<f32>, n: usize) -> f32 {

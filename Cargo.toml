@@ -12,3 +12,4 @@ crate-type=["cdylib"]
 [dependencies]
 redis-module = "0.7.0"
 lazy_static = "1.4.0"
+rand = "0.7.3"
