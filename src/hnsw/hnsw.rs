@@ -1,13 +1,13 @@
 use super::metrics;
 
 use ordered_float::OrderedFloat;
-use owning_ref::{MutexGuardRef, RefMutRefMut, RefRef};
+use owning_ref::{RefMutRefMut, RefRef, RwLockReadGuardRef, RwLockWriteGuardRefMut};
 use rand::prelude::*;
 use std::cell::RefCell;
 use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::{clone, fmt};
 
 #[derive(Debug)]
@@ -40,13 +40,33 @@ impl fmt::Display for HNSWRedisMode {
     }
 }
 
-type NodeRef<T> = Arc<Mutex<_Node<T>>>;
+type NodeRef<T> = Arc<RwLock<_Node<T>>>;
 
 #[derive(Debug, Clone)]
 pub struct _Node<T> {
     pub name: String,
     pub data: Vec<T>,
     pub neighbors: Vec<Vec<Node<T>>>,
+}
+
+impl<T> _Node<T> {
+    fn push_levels(&mut self, level: usize) {
+        let neighbors = &mut self.neighbors;
+        while neighbors.len() < level + 1 {
+            neighbors.push(Vec::new());
+        }
+    }
+
+    fn add_neighbor(&mut self, level: usize, neighbor: Node<T>) {
+        self.push_levels(level);
+        let neighbors = &mut self.neighbors;
+        neighbors[level].push(neighbor);
+    }
+
+    fn clear_neighbors(&mut self, level: usize) {
+        let neighbors = &mut self.neighbors;
+        neighbors[level] = Vec::new();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,18 +85,30 @@ impl<T> Node<T> {
             data: data,
             neighbors: Vec::with_capacity(capacity),
         };
-        Node(Arc::new(Mutex::new(node)))
+        Node(Arc::new(RwLock::new(node)))
     }
 
-    pub fn read(&self) -> MutexGuardRef<_Node<T>> {
-        MutexGuardRef::new(self.0.lock().unwrap())
+    pub fn read(&self) -> RwLockReadGuardRef<_Node<T>> {
+        RwLockReadGuardRef::new(self.0.try_read().unwrap())
     }
 
-    fn push_levels(&mut self, level: usize) {
-        let neighbors = &mut self.0.lock().unwrap().neighbors;
-        while neighbors.len() < level + 1 {
-            neighbors.push(Vec::new());
-        }
+    pub fn write(&self) -> RwLockWriteGuardRefMut<_Node<T>> {
+        RwLockWriteGuardRefMut::new(self.0.try_write().unwrap())
+    }
+
+    fn push_levels(&self, level: usize) {
+        let mut node = self.0.try_write().unwrap();
+        node.push_levels(level);
+    }
+
+    fn add_neighbor(&self, level: usize, neighbor: Node<T>) {
+        let node = &mut self.0.try_write().unwrap();
+        node.add_neighbor(level, neighbor);
+    }
+
+    fn clear_neighbors(&self, level: usize) {
+        let node = &mut self.0.try_write().unwrap();
+        node.clear_neighbors(level);
     }
 }
 
@@ -185,6 +217,7 @@ impl fmt::Display for Index {
              data_dim: {}\n\
              M: {}\n\
              ef_construction: {}\n\
+             level_mult: {}\n\
              node_count: {:?}\n\
              max_layer: {:?}\n\
              enterpoint: {:?}\n",
@@ -193,6 +226,7 @@ impl fmt::Display for Index {
             self.mfunc_kind,
             self.data_dim,
             self.m,
+            self.ef_construction,
             self.level_mult,
             self.node_count,
             self.max_layer,
@@ -234,7 +268,7 @@ impl Index {
             return Ok(());
         }
 
-        if self.nodes.get(name).is_none() {
+        if !self.nodes.get(name).is_none() {
             return Err(format!("Node: {:?} already exists", name).into());
         }
 
@@ -283,16 +317,21 @@ impl Index {
             while !neighbors.is_empty() {
                 let epair = neighbors.pop().unwrap();
                 let er = epair.read();
-                let eneighbors = &er.node.read().neighbors[lc];
-                let mut econn = BinaryHeap::with_capacity(eneighbors.len());
-                for n in eneighbors {
-                    let ensim = OrderedFloat::from((self.mfunc)(
-                        &er.node.read().data,
-                        &n.read().data,
-                        self.data_dim,
-                    ));
-                    let enpair = SimPair::new(ensim, n.to_owned());
-                    econn.push(enpair);
+
+                let mut econn: BinaryHeap<SimPair<f32>>;
+                {
+                    let enr = er.node.read();
+                    let eneighbors = &enr.neighbors[lc];
+                    econn = BinaryHeap::with_capacity(eneighbors.len());
+                    for n in eneighbors {
+                        let ensim = OrderedFloat::from((self.mfunc)(
+                            &enr.data,
+                            &n.read().data,
+                            self.data_dim,
+                        ));
+                        let enpair = SimPair::new(ensim, n.to_owned());
+                        econn.push(enpair);
+                    }
                 }
 
                 let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
@@ -333,11 +372,15 @@ impl Index {
         ef: usize,
         level: usize,
     ) -> BinaryHeap<SimPair<f32>> {
-        let er = ep.read();
         let mut v = HashSet::new();
-        v.insert(er.name.to_owned());
 
-        let qsim = OrderedFloat::from((self.mfunc)(query, &er.data, self.data_dim));
+        {
+            v.insert(ep.read().name.to_owned());
+        }
+        let qsim: OrderedFloat<f32>;
+        {
+            qsim = OrderedFloat::from((self.mfunc)(query, &ep.read().data, self.data_dim));
+        }
         let qpair = SimPair::new(qsim, ep.clone());
 
         let mut c = BinaryHeap::with_capacity(ef);
@@ -349,8 +392,10 @@ impl Index {
             let mut cpair = c.pop().unwrap();
             let mut fpair = w.peek().unwrap();
 
-            if cpair.read().sim < fpair.0.read().sim {
-                break;
+            {
+                if cpair.read().sim < fpair.0.read().sim {
+                    break;
+                }
             }
 
             // update C and W
@@ -358,8 +403,8 @@ impl Index {
                 cpair.write().node.push_levels(level);
             }
             let cpr = cpair.read();
-            let cnr = cpr.node.read();
-            for neighbor in &cnr.neighbors[level] {
+            let neighbors = &cpr.node.read().neighbors[level];
+            for neighbor in neighbors {
                 let nr = neighbor.read();
                 if !v.contains(&nr.name) {
                     v.insert(nr.name.clone());
@@ -475,15 +520,29 @@ impl Index {
         &self,
         query: &Node<f32>,
         neighbors: &BinaryHeap<SimPair<f32>>,
-        lc: usize,
+        level: usize,
     ) {
+        let mut neighbors = neighbors.clone();
+        while !neighbors.is_empty() {
+            let npair = neighbors.pop().unwrap();
+            let npr = npair.read();
+
+            query.add_neighbor(level, npr.node.clone());
+            npr.node.add_neighbor(level, query.clone());
+        }
     }
 
     fn update_node_connections(
         &self,
         node: &Node<f32>,
         conn: &BinaryHeap<SimPair<f32>>,
-        lc: usize,
+        level: usize,
     ) {
+        let mut conn = conn.clone();
+        node.clear_neighbors(level);
+        while !conn.is_empty() {
+            let newpair = conn.pop().unwrap();
+            node.add_neighbor(level, newpair.read().node.clone());
+        }
     }
 }
