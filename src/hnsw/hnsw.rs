@@ -258,6 +258,7 @@ impl Index {
             );
         }
 
+        let query = self.nodes.get(name).unwrap();
         let mut ep = self.enterpoint.as_ref().unwrap().clone();
         let mut w: BinaryHeap<SimPair<f32>>;
 
@@ -275,15 +276,45 @@ impl Index {
         lc = min(l_max, l);
         loop {
             w = self.search_level(data, ep.clone(), self.ef_construction, lc);
-            let query = self.nodes.get(name).unwrap();
-            let neighbors = self.select_neighbors(query, &w, self.m, lc, true, true, None);
+            let mut neighbors = self.select_neighbors(query, &w, self.m, lc, true, true, None);
+            self.connect_neighbors(query, &neighbors, lc);
 
-            ///// connect neighbors
+            // shrink connections as needed
+            while !neighbors.is_empty() {
+                let epair = neighbors.pop().unwrap();
+                let er = epair.read();
+                let eneighbors = &er.node.read().neighbors[lc];
+                let mut econn = BinaryHeap::with_capacity(eneighbors.len());
+                for n in eneighbors {
+                    let ensim = OrderedFloat::from((self.mfunc)(
+                        &er.node.read().data,
+                        &n.read().data,
+                        self.data_dim,
+                    ));
+                    let enpair = SimPair::new(ensim, n.to_owned());
+                    econn.push(enpair);
+                }
+
+                let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
+                if econn.len() > m_max {
+                    let enewconn =
+                        self.select_neighbors(&er.node, &econn, m_max, lc, true, true, None);
+                    self.update_node_connections(&er.node, &enewconn, lc);
+                }
+            }
+
+            ep = w.peek().unwrap().read().node.clone();
 
             if lc == 0 {
                 break;
             }
             lc -= 1;
+        }
+
+        // new enterpoint if we're in a higher layer
+        if l > l_max {
+            self.max_layer = l;
+            self.enterpoint = Some(query.to_owned());
         }
 
         Ok(())
@@ -438,5 +469,21 @@ impl Index {
         }
 
         r
+    }
+
+    fn connect_neighbors(
+        &self,
+        query: &Node<f32>,
+        neighbors: &BinaryHeap<SimPair<f32>>,
+        lc: usize,
+    ) {
+    }
+
+    fn update_node_connections(
+        &self,
+        node: &Node<f32>,
+        conn: &BinaryHeap<SimPair<f32>>,
+        lc: usize,
+    ) {
     }
 }
