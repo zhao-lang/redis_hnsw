@@ -8,6 +8,7 @@ extern crate redis_module;
 extern crate lazy_static;
 
 extern crate ordered_float;
+extern crate owning_ref;
 
 use hnsw::{HNSWRedisMode, Index};
 use redis_module::{
@@ -133,13 +134,13 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let data = dataf64.into_iter().map(|d| *d as f32).collect::<Vec<f32>>();
 
     // update index in global hashmap
-    ctx.log_debug(format!("Adding node: {} to Index: {}", &node_name, &index_name).as_str());
     let indices = INDICES.lock().unwrap();
     let mut index = indices
         .get(index_name.as_str())
         .ok_or_else(|| format!("Index: {} does not exists", index_name))?
         .lock()
         .unwrap();
+    ctx.log_debug(format!("Adding node: {} to Index: {}", &node_name, &index_name).as_str());
     index.add_node(&node_name, &data).unwrap();
 
     // write node to redis

@@ -2,7 +2,6 @@ use redis_module::native_types::RedisType;
 use redis_module::raw;
 use std::convert::From;
 use std::os::raw::c_void;
-use std::sync::{Arc, RwLock};
 
 use super::hnsw::{Index, Node};
 
@@ -35,19 +34,18 @@ pub struct NodeRedis {
     pub neighbors: Vec<Vec<String>>, // vector of neighbor node names
 }
 
-impl From<&Arc<RwLock<Node>>> for NodeRedis {
-    fn from(node: &Arc<RwLock<Node>>) -> Self {
+impl From<&Node<f32>> for NodeRedis {
+    fn from(node: &Node<f32>) -> Self {
+        let r = node.read();
         NodeRedis {
-            data: node.read().unwrap().data.clone(),
-            neighbors: node
-                .read()
-                .unwrap()
+            data: r.data.to_owned(),
+            neighbors: r
                 .neighbors
-                .clone()
+                .to_owned()
                 .into_iter()
                 .map(|l| {
                     l.into_iter()
-                        .map(|n| n.read().unwrap().name.to_owned())
+                        .map(|n| n.read().name.to_owned())
                         .collect::<Vec<String>>()
                 })
                 .collect(),

@@ -1,12 +1,13 @@
 use super::metrics;
 
 use ordered_float::OrderedFloat;
+use owning_ref::{MutexGuardRef, RefMutRefMut, RefRef};
 use rand::prelude::*;
 use std::cell::RefCell;
 use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::{clone, fmt};
 
 #[derive(Debug)]
@@ -39,71 +40,111 @@ impl fmt::Display for HNSWRedisMode {
     }
 }
 
+type NodeRef<T> = Arc<Mutex<_Node<T>>>;
+
 #[derive(Debug, Clone)]
-pub struct Node {
+pub struct _Node<T> {
     pub name: String,
-    pub data: Vec<f32>,
-    pub neighbors: Vec<Vec<Arc<RwLock<Node>>>>,
+    pub data: Vec<T>,
+    pub neighbors: Vec<Vec<Node<T>>>,
 }
 
-impl Node {
-    fn new(name: &str, data: &Vec<f32>, capacity: usize) -> Self {
-        Node {
+#[derive(Debug, Clone)]
+pub struct Node<T>(NodeRef<T>);
+
+impl<T> PartialEq for Node<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Node<T> {
+    fn new(name: &str, data: Vec<T>, capacity: usize) -> Self {
+        let node = _Node {
             name: name.to_owned(),
-            data: data.to_owned(),
+            data: data,
             neighbors: Vec::with_capacity(capacity),
-        }
+        };
+        Node(Arc::new(Mutex::new(node)))
+    }
+
+    pub fn read(&self) -> MutexGuardRef<_Node<T>> {
+        MutexGuardRef::new(self.0.lock().unwrap())
     }
 
     fn push_levels(&mut self, level: usize) {
-        while self.neighbors.len() < level + 1 {
-            self.neighbors.push(Vec::new());
+        let neighbors = &mut self.0.lock().unwrap().neighbors;
+        while neighbors.len() < level + 1 {
+            neighbors.push(Vec::new());
         }
     }
 }
 
+type SimPairRef<T> = Rc<RefCell<_SimPair<T>>>;
+
 #[derive(Debug, Clone)]
-struct SimPair {
+struct _SimPair<T> {
     pub sim: OrderedFloat<f32>,
-    pub node: Arc<RwLock<Node>>,
+    pub node: Node<T>,
 }
 
-impl PartialEq for SimPair {
+#[derive(Debug, Clone)]
+struct SimPair<T>(SimPairRef<T>);
+
+impl<T> SimPair<T> {
+    fn new(sim: OrderedFloat<f32>, node: Node<T>) -> Self {
+        let sp = _SimPair {
+            sim: sim,
+            node: node,
+        };
+        SimPair(Rc::new(RefCell::new(sp)))
+    }
+
+    fn read(&self) -> RefRef<_SimPair<T>> {
+        RefRef::new(self.0.borrow())
+    }
+
+    fn write(&mut self) -> RefMutRefMut<_SimPair<T>> {
+        RefMutRefMut::new(self.0.borrow_mut())
+    }
+}
+
+impl<T> PartialEq for SimPair<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.sim == other.sim
+        self.0.borrow().sim == other.0.borrow().sim
     }
 }
 
-impl Eq for SimPair {}
+impl<T> Eq for SimPair<T> {}
 
-impl PartialOrd for SimPair {
+impl<T> PartialOrd for SimPair<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.sim.partial_cmp(&other.sim)
+        self.0.borrow().sim.partial_cmp(&other.0.borrow().sim)
     }
 }
 
-impl Ord for SimPair {
+impl<T> Ord for SimPair<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.sim.cmp(&other.sim)
+        self.0.borrow().sim.cmp(&other.0.borrow().sim)
     }
 }
 
 pub struct Index {
-    pub name: String,                              // index name
-    pub mode: HNSWRedisMode,                       // redis mode
-    pub mfunc: Box<metrics::MetricFuncT>,          // metric function
-    pub mfunc_kind: metrics::MetricFuncs,          // kind of the metric function
-    pub data_dim: usize,                           // dimensionality of the data
-    pub m: usize,                                  // out vertexts per node
-    pub m_max: usize,                              // max number of vertexes per node
-    pub m_max_0: usize,                            // max number of vertexes at layer 0
-    pub ef_construction: usize,                    // size of dynamic candidate list
-    pub level_mult: f64,                           // level generation factor
-    pub node_count: usize,                         // count of nodes
-    pub max_layer: usize,                          // idx of top layer
-    pub nodes: HashMap<String, Arc<RwLock<Node>>>, // hashmap of nodes
-    pub enterpoint: Option<Arc<RwLock<Node>>>,     // string key to the enterpoint node
-    rng_: StdRng,                                  // rng for level generation
+    pub name: String,                          // index name
+    pub mode: HNSWRedisMode,                   // redis mode
+    pub mfunc: Box<metrics::MetricFuncT<f32>>, // metric function
+    pub mfunc_kind: metrics::MetricFuncs,      // kind of the metric function
+    pub data_dim: usize,                       // dimensionality of the data
+    pub m: usize,                              // out vertexts per node
+    pub m_max: usize,                          // max number of vertexes per node
+    pub m_max_0: usize,                        // max number of vertexes at layer 0
+    pub ef_construction: usize,                // size of dynamic candidate list
+    pub level_mult: f64,                       // level generation factor
+    pub node_count: usize,                     // count of nodes
+    pub max_layer: usize,                      // idx of top layer
+    pub nodes: HashMap<String, Node<f32>>,     // hashmap of nodes
+    pub enterpoint: Option<Node<f32>>,         // string key to the enterpoint node
+    rng_: StdRng,                              // rng for level generation
 }
 
 impl Index {
@@ -185,7 +226,7 @@ impl clone::Clone for Index {
 impl Index {
     pub fn add_node(&mut self, name: &str, data: &Vec<f32>) -> Result<(), HNSWError> {
         if self.node_count == 0 {
-            let node = Arc::new(RwLock::new(Node::new(name, data, self.m_max_0)));
+            let node = Node::new(name, data.to_owned(), self.m_max_0);
             self.enterpoint = Some(node.clone());
             self.nodes.insert(name.to_owned(), node);
             self.node_count += 1;
@@ -208,22 +249,22 @@ impl Index {
         if l_max == 0 {
             self.nodes.insert(
                 name.to_owned(),
-                Arc::new(RwLock::new(Node::new(name, data, self.m_max_0))),
+                Node::new(name, data.to_owned(), self.m_max_0),
             );
         } else {
             self.nodes.insert(
                 name.to_owned(),
-                Arc::new(RwLock::new(Node::new(name, data, self.m_max))),
+                Node::new(name, data.to_owned(), self.m_max),
             );
         }
 
         let mut ep = self.enterpoint.as_ref().unwrap().clone();
-        let mut w: BinaryHeap<SimPair>;
+        let mut w: BinaryHeap<SimPair<f32>>;
 
         let mut lc = l_max;
         while lc > l {
             w = self.search_level(data, ep.clone(), 1, lc);
-            ep = w.pop().unwrap().node;
+            ep = w.pop().unwrap().read().node.clone();
 
             if lc == 0 {
                 break;
@@ -231,10 +272,19 @@ impl Index {
             lc -= 1;
         }
 
-        // lc = min(l_max, l);
-        // while lc >= 0 {
-        //     w = self.search_level(data, ep.clone(), self.ef_construction_, lc);
-        // }
+        lc = min(l_max, l);
+        loop {
+            w = self.search_level(data, ep.clone(), self.ef_construction, lc);
+            let query = self.nodes.get(name).unwrap();
+            let neighbors = self.select_neighbors(query, &w, self.m, lc, true, true, None);
+
+            ///// connect neighbors
+
+            if lc == 0 {
+                break;
+            }
+            lc -= 1;
+        }
 
         Ok(())
     }
@@ -247,44 +297,146 @@ impl Index {
 
     fn search_level(
         &self,
-        query: &Vec<f32>,
-        ep: Arc<RwLock<Node>>,
+        query: &[f32],
+        ep: Node<f32>,
         ef: usize,
         level: usize,
-    ) -> BinaryHeap<SimPair> {
+    ) -> BinaryHeap<SimPair<f32>> {
+        let er = ep.read();
         let mut v = HashSet::new();
-        v.insert(ep.read().unwrap().name.clone());
+        v.insert(er.name.to_owned());
 
-        let qsim = (self.mfunc)(query, &ep.read().unwrap().data, self.data_dim);
-        let qpair = Rc::new(RefCell::new(SimPair {
-            sim: OrderedFloat::from(qsim),
-            node: ep.clone(),
-        }));
+        let qsim = OrderedFloat::from((self.mfunc)(query, &er.data, self.data_dim));
+        let qpair = SimPair::new(qsim, ep.clone());
 
         let mut c = BinaryHeap::with_capacity(ef);
         let mut w = BinaryHeap::with_capacity(ef);
         c.push(qpair.clone());
         w.push(Reverse(qpair.clone()));
 
-        while c.len() > 0 {
-            let cpair = c.pop().unwrap();
-            let fpair = w.peek().unwrap();
+        while !c.is_empty() {
+            let mut cpair = c.pop().unwrap();
+            let mut fpair = w.peek().unwrap();
 
-            if cpair.borrow().sim < fpair.0.borrow().sim {
+            if cpair.read().sim < fpair.0.read().sim {
                 break;
             }
 
             // update C and W
-            cpair.borrow_mut().node.write().unwrap().push_levels(level);
-            for neighbor in &cpair.borrow().node.read().unwrap().neighbors[level] {
-                if v.contains(&neighbor.read().unwrap().name) {}
+            {
+                cpair.write().node.push_levels(level);
+            }
+            let cpr = cpair.read();
+            let cnr = cpr.node.read();
+            for neighbor in &cnr.neighbors[level] {
+                let nr = neighbor.read();
+                if !v.contains(&nr.name) {
+                    v.insert(nr.name.clone());
+
+                    fpair = w.peek().unwrap();
+                    let esim = OrderedFloat::from((self.mfunc)(query, &nr.data, self.data_dim));
+                    if esim > fpair.0.read().sim || w.len() < ef {
+                        let epair = SimPair::new(esim, neighbor.clone());
+                        c.push(epair.clone());
+                        w.push(Reverse(epair.clone()));
+
+                        if w.len() > ef {
+                            w.pop();
+                        }
+                    }
+                }
             }
         }
 
         let mut res = BinaryHeap::new();
-        for pair in c {
-            res.push(pair.borrow().clone());
+        for pair in w {
+            res.push(pair.0);
         }
         res
+    }
+
+    fn select_neighbors(
+        &self,
+        query: &Node<f32>,
+        c: &BinaryHeap<SimPair<f32>>,
+        m: usize,
+        lc: usize,
+        extend_candidates: bool,
+        keep_pruned_connections: bool,
+        ignored_node: Option<&Node<f32>>,
+    ) -> BinaryHeap<SimPair<f32>> {
+        let mut r: BinaryHeap<SimPair<f32>> = BinaryHeap::with_capacity(m);
+        let mut w = c.clone();
+        let mut wd = BinaryHeap::new();
+
+        // extend candidates by their neighbors
+        if extend_candidates {
+            let mut ccopy = c.clone();
+
+            let mut v = HashSet::new();
+            while !ccopy.is_empty() {
+                let epair = ccopy.pop().unwrap();
+                v.insert(epair.read().node.read().name.clone());
+            }
+
+            ccopy = c.clone();
+            while !ccopy.is_empty() {
+                let epair = ccopy.pop().unwrap();
+
+                for eneighbor in &epair.read().node.read().neighbors[lc] {
+                    if *eneighbor == *query
+                        || (ignored_node.is_some() && *eneighbor == *ignored_node.unwrap())
+                    {
+                        continue;
+                    }
+
+                    let enr = eneighbor.read();
+                    if !v.contains(&enr.name) {
+                        let ensim = OrderedFloat::from((self.mfunc)(
+                            &query.read().data,
+                            &enr.data,
+                            self.data_dim,
+                        ));
+                        let enpair = SimPair::new(ensim, eneighbor.clone());
+                        w.push(enpair);
+                        v.insert(enr.name.clone());
+                    }
+                }
+            }
+        }
+
+        while !w.is_empty() && r.len() < m {
+            let epair = w.pop().unwrap();
+            let enr = epair.read();
+
+            if enr.node == *query || (ignored_node.is_some() && enr.node == *ignored_node.unwrap())
+            {
+                continue;
+            }
+
+            if r.is_empty() || enr.sim > r.peek().unwrap().read().sim {
+                r.push(epair.clone());
+            } else {
+                wd.push(epair.clone());
+            }
+        }
+
+        // add back some of the discarded connections
+        if keep_pruned_connections {
+            while !wd.is_empty() && r.len() < m {
+                let ppair = wd.pop().unwrap();
+                {
+                    let pr = ppair.read();
+                    if pr.node == *query
+                        || (ignored_node.is_some() && pr.node == *ignored_node.unwrap())
+                    {
+                        continue;
+                    }
+                }
+                r.push(ppair);
+            }
+        }
+
+        r
     }
 }

@@ -9,9 +9,9 @@ pub enum MetricFuncs {
     Euclidean,
 }
 
-pub type MetricFuncT = fn(&Vec<f32>, &Vec<f32>, usize) -> f32;
+pub type MetricFuncT<T> = fn(&[T], &[T], usize) -> f32;
 
-pub fn euclidean(v1: &Vec<f32>, v2: &Vec<f32>, n: usize) -> f32 {
+pub fn euclidean(v1: &[f32], v2: &[f32], n: usize) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx2") {
@@ -44,7 +44,7 @@ fn hsum256_ps_avx(v: __m256) -> f32 {
 // since FMA has a latency of 5 cycles but 0.5 CPI
 // https://stackoverflow.com/questions/45735679/euclidean-distance-using-intrinsic-instruction
 // TODO: extend functionality for vectors of non-multiples of 32 floats
-pub fn sim_func_avx_euc(a: &Vec<f32>, b: &Vec<f32>, n: usize) -> f32 {
+pub fn sim_func_avx_euc(a: &[f32], b: &[f32], n: usize) -> f32 {
     unsafe {
         let mut euc1: __m256 = _mm256_setzero_ps();
         let mut euc2: __m256 = _mm256_setzero_ps();
@@ -75,7 +75,7 @@ pub fn sim_func_avx_euc(a: &Vec<f32>, b: &Vec<f32>, n: usize) -> f32 {
     }
 }
 
-pub fn sim_func_euc(a: &Vec<f32>, b: &Vec<f32>, _n: usize) -> f32 {
+pub fn sim_func_euc(a: &[f32], b: &[f32], _n: usize) -> f32 {
     -a.iter()
         .zip(b)
         .map(|(x, y)| (x - y) * (x - y))
