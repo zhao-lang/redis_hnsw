@@ -1,10 +1,31 @@
 use super::metrics;
 
+use ordered_float::OrderedFloat;
 use rand::prelude::*;
-use redis_module::RedisError;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 use std::{clone, fmt};
+
+#[derive(Debug)]
+pub enum HNSWError {
+    Str(&'static str),
+    String(String),
+}
+
+impl From<&'static str> for HNSWError {
+    fn from(s: &'static str) -> Self {
+        HNSWError::Str(s)
+    }
+}
+
+impl From<String> for HNSWError {
+    fn from(s: String) -> Self {
+        HNSWError::String(s)
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub enum HNSWRedisMode {
@@ -18,41 +39,74 @@ impl fmt::Display for HNSWRedisMode {
     }
 }
 
-pub struct Node<'a> {
-    pub name_: String,
-    pub data_: Vec<f32>,
-    pub neighbors_: Vec<&'a Node<'a>>,
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub name: String,
+    pub data: Vec<f32>,
+    pub neighbors: Vec<Vec<Arc<RwLock<Node>>>>,
 }
 
-impl<'a> Node<'a> {
-    fn new(name: &str, data: Vec<f32>) -> Self {
+impl Node {
+    fn new(name: &str, data: &Vec<f32>, capacity: usize) -> Self {
         Node {
-            name_: name.to_owned(),
-            data_: data,
-            neighbors_: Vec::new(),
+            name: name.to_owned(),
+            data: data.to_owned(),
+            neighbors: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push_levels(&mut self, level: usize) {
+        while self.neighbors.len() < level + 1 {
+            self.neighbors.push(Vec::new());
         }
     }
 }
 
-pub struct Index<'a> {
-    pub name_: String,                          // index name
-    pub mode_: HNSWRedisMode,                   // redis mode
-    pub mfunc_: Box<metrics::MetricFuncT>,      // metric function
-    pub mfunc_kind_: metrics::MetricFuncs,      // kind of the metric function
-    pub data_dim_: usize,                       // dimensionality of the data
-    pub m_: usize,                              // out vertexts per node
-    pub m_max_: usize,                          // max number of vertexes per node
-    pub m_max_0_: usize,                        // max number of vertexes at layer 0
-    pub ef_construction_: usize,                // size of dynamic candidate list
-    pub level_mult_: f64,                       // level generation factor
-    pub node_count_: Mutex<usize>,              // count of nodes
-    pub max_layer_: Mutex<usize>,               // idx of top layer
-    pub nodes_: HashMap<String, Box<Node<'a>>>, // hashmap of nodes
-    pub enterpoint_: Option<String>,            // string key to the enterpoint node
-    rng_: StdRng,                               // rng for level generation
+#[derive(Debug, Clone)]
+struct SimPair {
+    pub sim: OrderedFloat<f32>,
+    pub node: Arc<RwLock<Node>>,
 }
 
-impl<'a> Index<'a> {
+impl PartialEq for SimPair {
+    fn eq(&self, other: &Self) -> bool {
+        self.sim == other.sim
+    }
+}
+
+impl Eq for SimPair {}
+
+impl PartialOrd for SimPair {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.sim.partial_cmp(&other.sim)
+    }
+}
+
+impl Ord for SimPair {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sim.cmp(&other.sim)
+    }
+}
+
+pub struct Index {
+    pub name: String,                              // index name
+    pub mode: HNSWRedisMode,                       // redis mode
+    pub mfunc: Box<metrics::MetricFuncT>,          // metric function
+    pub mfunc_kind: metrics::MetricFuncs,          // kind of the metric function
+    pub data_dim: usize,                           // dimensionality of the data
+    pub m: usize,                                  // out vertexts per node
+    pub m_max: usize,                              // max number of vertexes per node
+    pub m_max_0: usize,                            // max number of vertexes at layer 0
+    pub ef_construction: usize,                    // size of dynamic candidate list
+    pub level_mult: f64,                           // level generation factor
+    pub node_count: usize,                         // count of nodes
+    pub max_layer: usize,                          // idx of top layer
+    pub nodes: HashMap<String, Arc<RwLock<Node>>>, // hashmap of nodes
+    pub enterpoint: Option<Arc<RwLock<Node>>>,     // string key to the enterpoint node
+    rng_: StdRng,                                  // rng for level generation
+}
+
+impl Index {
     pub fn new(
         name: &str,
         mode: HNSWRedisMode,
@@ -61,26 +115,26 @@ impl<'a> Index<'a> {
         ef_construction: usize,
     ) -> Self {
         Index {
-            name_: name.to_string(),
-            mode_: mode,
-            mfunc_: Box::new(metrics::euclidean),
-            mfunc_kind_: metrics::MetricFuncs::Euclidean,
-            data_dim_: data_dim,
-            m_: m,
-            m_max_: m,
-            m_max_0_: m * 2,
-            ef_construction_: ef_construction,
-            level_mult_: 1.0 / (1.0 * m as f64).ln(),
-            node_count_: Mutex::new(0),
-            max_layer_: Mutex::new(0),
-            nodes_: HashMap::new(),
-            enterpoint_: None,
+            name: name.to_string(),
+            mode: mode,
+            mfunc: Box::new(metrics::euclidean),
+            mfunc_kind: metrics::MetricFuncs::Euclidean,
+            data_dim: data_dim,
+            m: m,
+            m_max: m,
+            m_max_0: m * 2,
+            ef_construction: ef_construction,
+            level_mult: 1.0 / (1.0 * m as f64).ln(),
+            node_count: 0,
+            max_layer: 0,
+            nodes: HashMap::new(),
+            enterpoint: None,
             rng_: StdRng::from_entropy(),
         }
     }
 }
 
-impl<'a> fmt::Display for Index<'a> {
+impl fmt::Display for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -93,55 +147,144 @@ impl<'a> fmt::Display for Index<'a> {
              node_count: {:?}\n\
              max_layer: {:?}\n\
              enterpoint: {:?}\n",
-            self.name_,
-            self.mode_,
-            self.mfunc_kind_,
-            self.data_dim_,
-            self.m_,
-            self.ef_construction_,
-            *self.node_count_.lock().unwrap(),
-            *self.max_layer_.lock().unwrap(),
-            self.enterpoint_,
+            self.name,
+            self.mode,
+            self.mfunc_kind,
+            self.data_dim,
+            self.m,
+            self.level_mult,
+            self.node_count,
+            self.max_layer,
+            self.enterpoint,
         )
     }
 }
 
-impl<'a> clone::Clone for Index<'a> {
+impl clone::Clone for Index {
     fn clone(&self) -> Self {
         Index {
-            name_: self.name_.clone(),
-            mode_: self.mode_,
-            mfunc_: self.mfunc_.clone(),
-            mfunc_kind_: self.mfunc_kind_,
-            data_dim_: self.data_dim_,
-            m_: self.m_,
-            m_max_: self.m_max_,
-            m_max_0_: self.m_max_0_,
-            ef_construction_: self.ef_construction_,
-            level_mult_: self.level_mult_,
-            node_count_: Mutex::new(*self.node_count_.lock().unwrap()),
-            max_layer_: Mutex::new(*self.max_layer_.lock().unwrap()),
-            nodes_: HashMap::new(), // blank map for now, rehydrate nodes from node set in redis
-            enterpoint_: self.enterpoint_.clone(),
+            name: self.name.clone(),
+            mode: self.mode,
+            mfunc: self.mfunc.clone(),
+            mfunc_kind: self.mfunc_kind,
+            data_dim: self.data_dim,
+            m: self.m,
+            m_max: self.m_max,
+            m_max_0: self.m_max_0,
+            ef_construction: self.ef_construction,
+            level_mult: self.level_mult,
+            node_count: self.node_count,
+            max_layer: self.max_layer,
+            nodes: HashMap::new(), // blank map for now, rehydrate nodes from node set in redis
+            enterpoint: self.enterpoint.clone(),
             rng_: self.rng_.clone(),
         }
     }
 }
 
-impl<'a> Index<'a> {
-    pub fn add_node(&mut self, name: &str, data: Vec<f32>) -> Result<(), RedisError> {
-        if *self.node_count_.lock().unwrap() == 0 {
-            let node = Node::new(name, data);
+impl Index {
+    pub fn add_node(&mut self, name: &str, data: &Vec<f32>) -> Result<(), HNSWError> {
+        if self.node_count == 0 {
+            let node = Arc::new(RwLock::new(Node::new(name, data, self.m_max_0)));
+            self.enterpoint = Some(node.clone());
+            self.nodes.insert(name.to_owned(), node);
+            self.node_count += 1;
 
-            self.nodes_.insert(name.to_owned(), Box::new(node));
-            *self.node_count_.lock().unwrap() += 1;
-            self.enterpoint_ = Some(name.to_owned());
+            return Ok(());
+        }
+
+        if self.nodes.get(name).is_none() {
+            return Err(format!("Node: {:?} already exists", name).into());
+        }
+
+        self.insert(name, data)
+    }
+
+    // perform insertion of new nodes into the index
+    fn insert(&mut self, name: &str, data: &Vec<f32>) -> Result<(), HNSWError> {
+        let l = self.gen_random_level();
+        let l_max = self.max_layer;
+
+        if l_max == 0 {
+            self.nodes.insert(
+                name.to_owned(),
+                Arc::new(RwLock::new(Node::new(name, data, self.m_max_0))),
+            );
         } else {
-            if self.nodes_.get(name).is_none() {
-                return Err(format!("Node: {:?} already exists", name).into());
+            self.nodes.insert(
+                name.to_owned(),
+                Arc::new(RwLock::new(Node::new(name, data, self.m_max))),
+            );
+        }
+
+        let mut ep = self.enterpoint.as_ref().unwrap().clone();
+        let mut w: BinaryHeap<SimPair>;
+
+        let mut lc = l_max;
+        while lc > l {
+            w = self.search_level(data, ep.clone(), 1, lc);
+            ep = w.pop().unwrap().node;
+
+            if lc == 0 {
+                break;
+            }
+            lc -= 1;
+        }
+
+        // lc = min(l_max, l);
+        // while lc >= 0 {
+        //     w = self.search_level(data, ep.clone(), self.ef_construction_, lc);
+        // }
+
+        Ok(())
+    }
+
+    fn gen_random_level(&mut self) -> usize {
+        let dist = rand::distributions::Uniform::from(0_f64..1_f64);
+        let r: f64 = dist.sample(&mut self.rng_);
+        (-r.ln() * self.level_mult) as usize
+    }
+
+    fn search_level(
+        &self,
+        query: &Vec<f32>,
+        ep: Arc<RwLock<Node>>,
+        ef: usize,
+        level: usize,
+    ) -> BinaryHeap<SimPair> {
+        let mut v = HashSet::new();
+        v.insert(ep.read().unwrap().name.clone());
+
+        let qsim = (self.mfunc)(query, &ep.read().unwrap().data, self.data_dim);
+        let qpair = Rc::new(RefCell::new(SimPair {
+            sim: OrderedFloat::from(qsim),
+            node: ep.clone(),
+        }));
+
+        let mut c = BinaryHeap::with_capacity(ef);
+        let mut w = BinaryHeap::with_capacity(ef);
+        c.push(qpair.clone());
+        w.push(Reverse(qpair.clone()));
+
+        while c.len() > 0 {
+            let cpair = c.pop().unwrap();
+            let fpair = w.peek().unwrap();
+
+            if cpair.borrow().sim < fpair.0.borrow().sim {
+                break;
+            }
+
+            // update C and W
+            cpair.borrow_mut().node.write().unwrap().push_levels(level);
+            for neighbor in &cpair.borrow().node.read().unwrap().neighbors[level] {
+                if v.contains(&neighbor.read().unwrap().name) {}
             }
         }
 
-        Ok(())
+        let mut res = BinaryHeap::new();
+        for pair in c {
+            res.push(pair.borrow().clone());
+        }
+        res
     }
 }

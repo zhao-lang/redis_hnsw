@@ -13,3 +13,4 @@ crate-type=["cdylib"]
 redis-module = "0.7.0"
 lazy_static = "1.4.0"
 rand = "0.7.3"
+ordered-float = "1.0.2"

@@ -7,6 +7,8 @@ extern crate redis_module;
 #[macro_use]
 extern crate lazy_static;
 
+extern crate ordered_float;
+
 use hnsw::{HNSWRedisMode, Index};
 use redis_module::{
     parse_float, parse_unsigned_integer, Context, NextArg, RedisError, RedisResult,
@@ -18,7 +20,7 @@ use std::sync::Mutex;
 static PREFIX: &str = "hnsw";
 
 lazy_static! {
-    static ref INDICES: Mutex<HashMap<String, Mutex<Index<'static>>>> = Mutex::new(HashMap::new());
+    static ref INDICES: Mutex<HashMap<String, Mutex<Index>>> = Mutex::new(HashMap::new());
 }
 
 fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -102,8 +104,8 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.log_debug(format!("{:#}", index).as_str());
 
     // get index from redis
-    ctx.log_debug(format!("get key: {}", &index.name_).as_str());
-    let rkey = ctx.open_key(&index.name_);
+    ctx.log_debug(format!("get key: {}", &index.name).as_str());
+    let rkey = ctx.open_key(&index.name);
 
     let output: String = match rkey.get_value::<Index>(&types::HNSW_INDEX_REDIS_TYPE)? {
         Some(value) => {
@@ -138,20 +140,11 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
         .ok_or_else(|| format!("Index: {} does not exists", index_name))?
         .lock()
         .unwrap();
-    index.add_node(&node_name, data.clone()).unwrap();
+    index.add_node(&node_name, &data).unwrap();
 
     // write node to redis
-    let node = index.nodes_.get(&node_name).unwrap();
-    let rnode = types::NodeRedis {
-        data: node.data_.clone(),
-        neighbors: node
-            .neighbors_
-            .clone()
-            .into_iter()
-            .map(|n| n.name_.to_owned())
-            .collect::<Vec<String>>(),
-    };
-    write_node(ctx, &node_name, rnode).unwrap();
+    let node = index.nodes.get(&node_name).unwrap();
+    write_node(ctx, &node_name, node.into()).unwrap();
 
     let index_nodes = format!("{}.{}", index_name, "nodeset");
     ctx.call("SADD", &[&index_nodes, &node_name])?;
