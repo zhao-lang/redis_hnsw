@@ -138,10 +138,12 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
         .ok_or_else(|| format!("Index: {} does not exists", index_name))?
         .write()
         .unwrap();
+
     ctx.log_debug(format!("Adding node: {} to Index: {}", &node_name, &index_name).as_str());
-    index
-        .add_node(&node_name, &data)
-        .unwrap_or_else(|e| ctx.log_debug(format!("{:?}", e).as_str()));
+    match index.add_node(&node_name, &data) {
+        Err(e) => return Err(e.error_string().into()),
+        _ => (),
+    }
 
     // write node to redis
     let node = index.nodes.get(&node_name).unwrap();
@@ -154,15 +156,36 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 }
 
 fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
-    if args.len() < 2 {
+    if args.len() < 4 {
         return Err(RedisError::WrongArity);
     }
 
     let index_name = format!("{}.{}", PREFIX, &args[1]);
     let indices = INDICES.read().unwrap();
-    ctx.log_debug(format!("{:?}", indices).as_str());
+    let index = indices
+        .get(index_name.as_str())
+        .ok_or_else(|| format!("Index: {} does not exists", index_name))?
+        .write()
+        .unwrap();
+    let k = parse_unsigned_integer(&args[2])? as usize;
+    let dataf64 = &args[3..]
+        .into_iter()
+        .map(|s| parse_float(s))
+        .collect::<Result<Vec<f64>, RedisError>>()?;
+    let data = dataf64.into_iter().map(|d| *d as f32).collect::<Vec<f32>>();
 
-    Ok(index_name.into())
+    ctx.log_debug(
+        format!(
+            "Searching for {} nearest nodes in Index: {}",
+            k, &index_name
+        )
+        .as_str(),
+    );
+
+    match index.search_knn(&data, k) {
+        Ok(res) => return Ok(format!("{:?}", res).into()),
+        Err(e) => return Err(e.error_string().into()),
+    };
 }
 
 pub fn hnsw_node_set(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -218,8 +241,8 @@ redis_module! {
     commands: [
         ["hnsw.new", new_index, ""],
         ["hnsw.get", get_index, ""],
+        ["hnsw.search", search_knn, ""],
         ["hnsw.node.add", add_node, ""],
-        ["hnsw.node.search", search_knn, ""],
         ["hnsw.node.set", hnsw_node_set, ""],
         ["hnsw.node.get", hnsw_node_get, ""],
     ],

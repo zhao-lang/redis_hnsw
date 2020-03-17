@@ -28,6 +28,12 @@ impl From<String> for HNSWError {
     }
 }
 
+impl HNSWError {
+    pub fn error_string(&self) -> String {
+        format!("{:?}", self)
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum HNSWRedisMode {
     Source,
@@ -40,16 +46,36 @@ impl fmt::Display for HNSWRedisMode {
     }
 }
 
+#[derive(Debug)]
+pub struct SearchResult<T> {
+    pub sim: OrderedFloat<f32>,
+    pub name: String,
+    pub data: Vec<T>,
+}
+
+impl<T: std::clone::Clone> SearchResult<T> {
+    fn new(sim: OrderedFloat<f32>, name: &str, data: &[T]) -> Self {
+        SearchResult {
+            sim: sim,
+            name: name.to_owned(),
+            data: data.to_vec(),
+        }
+    }
+}
+
 type NodeRef<T> = Arc<RwLock<_Node<T>>>;
 
 #[derive(Clone)]
-pub struct _Node<T> {
+pub struct _Node<T>
+where
+    T: std::clone::Clone,
+{
     pub name: String,
     pub data: Vec<T>,
     pub neighbors: Vec<Vec<Node<T>>>,
 }
 
-impl<T: fmt::Debug> fmt::Debug for _Node<T> {
+impl<T: fmt::Debug + std::clone::Clone> fmt::Debug for _Node<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -70,7 +96,7 @@ impl<T: fmt::Debug> fmt::Debug for _Node<T> {
     }
 }
 
-impl<T> _Node<T> {
+impl<T: std::clone::Clone> _Node<T> {
     fn push_levels(&mut self, level: usize) {
         let neighbors = &mut self.neighbors;
         while neighbors.len() < level + 1 {
@@ -91,19 +117,21 @@ impl<T> _Node<T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Node<T>(NodeRef<T>);
+pub struct Node<T>(NodeRef<T>)
+where
+    T: std::clone::Clone;
 
-impl<T> PartialEq for Node<T> {
+impl<T: std::clone::Clone> PartialEq for Node<T> {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl<T> Node<T> {
-    fn new(name: &str, data: Vec<T>, capacity: usize) -> Self {
+impl<T: std::clone::Clone> Node<T> {
+    fn new(name: &str, data: &[T], capacity: usize) -> Self {
         let node = _Node {
             name: name.to_owned(),
-            data: data,
+            data: data.to_vec(),
             neighbors: Vec::with_capacity(capacity),
         };
         Node(Arc::new(RwLock::new(node)))
@@ -136,15 +164,20 @@ impl<T> Node<T> {
 type SimPairRef<T> = Rc<RefCell<_SimPair<T>>>;
 
 #[derive(Debug, Clone)]
-struct _SimPair<T> {
+struct _SimPair<T>
+where
+    T: std::clone::Clone,
+{
     pub sim: OrderedFloat<f32>,
     pub node: Node<T>,
 }
 
 #[derive(Debug, Clone)]
-struct SimPair<T>(SimPairRef<T>);
+struct SimPair<T>(SimPairRef<T>)
+where
+    T: std::clone::Clone;
 
-impl<T> SimPair<T> {
+impl<T: std::clone::Clone> SimPair<T> {
     fn new(sim: OrderedFloat<f32>, node: Node<T>) -> Self {
         let sp = _SimPair {
             sim: sim,
@@ -162,21 +195,21 @@ impl<T> SimPair<T> {
     }
 }
 
-impl<T> PartialEq for SimPair<T> {
+impl<T: std::clone::Clone> PartialEq for SimPair<T> {
     fn eq(&self, other: &Self) -> bool {
         self.0.borrow().sim == other.0.borrow().sim
     }
 }
 
-impl<T> Eq for SimPair<T> {}
+impl<T: std::clone::Clone> Eq for SimPair<T> {}
 
-impl<T> PartialOrd for SimPair<T> {
+impl<T: std::clone::Clone> PartialOrd for SimPair<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.0.borrow().sim.partial_cmp(&other.0.borrow().sim)
     }
 }
 
-impl<T> Ord for SimPair<T> {
+impl<T: std::clone::Clone> Ord for SimPair<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.borrow().sim.cmp(&other.0.borrow().sim)
     }
@@ -282,9 +315,13 @@ impl clone::Clone for Index {
 }
 
 impl Index {
-    pub fn add_node(&mut self, name: &str, data: &Vec<f32>) -> Result<(), HNSWError> {
+    pub fn add_node(&mut self, name: &str, data: &[f32]) -> Result<(), HNSWError> {
+        if data.len() != self.data_dim {
+            return Err(format!("data dimension: {} does not match Index", data.len()).into());
+        }
+
         if self.node_count == 0 {
-            let node = Node::new(name, data.to_owned(), self.m_max_0);
+            let node = Node::new(name, data, self.m_max_0);
             self.enterpoint = Some(node.clone());
             self.nodes.insert(name.to_owned(), node);
             self.node_count += 1;
@@ -299,21 +336,28 @@ impl Index {
         self.insert(name, data)
     }
 
+    pub fn search_knn(&self, data: &[f32], k: usize) -> Result<Vec<SearchResult<f32>>, HNSWError> {
+        if data.len() != self.data_dim {
+            return Err(format!("data dimension: {} does not match Index", data.len()).into());
+        }
+        if self.enterpoint.is_none() || self.node_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(self.search_knn_internal(data, k, self.ef_construction))
+    }
+
     // perform insertion of new nodes into the index
-    fn insert(&mut self, name: &str, data: &Vec<f32>) -> Result<(), HNSWError> {
+    fn insert(&mut self, name: &str, data: &[f32]) -> Result<(), HNSWError> {
         let l = self.gen_random_level();
         let l_max = self.max_layer;
 
         if l_max == 0 {
-            self.nodes.insert(
-                name.to_owned(),
-                Node::new(name, data.to_owned(), self.m_max_0),
-            );
+            self.nodes
+                .insert(name.to_owned(), Node::new(name, data, self.m_max_0));
         } else {
-            self.nodes.insert(
-                name.to_owned(),
-                Node::new(name, data.to_owned(), self.m_max),
-            );
+            self.nodes
+                .insert(name.to_owned(), Node::new(name, data, self.m_max));
         }
         self.node_count += 1;
 
@@ -569,5 +613,28 @@ impl Index {
             let newpair = conn.pop().unwrap();
             node.add_neighbor(level, newpair.read().node.clone());
         }
+    }
+
+    fn search_knn_internal(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult<f32>> {
+        let mut ep = self.enterpoint.as_ref().unwrap().clone();
+        let l_max = self.max_layer;
+
+        let mut lc = l_max;
+        while lc > 0 {
+            let w = self.search_level(query, ep, 1, lc);
+            ep = w.peek().unwrap().read().node.clone();
+            lc -= 1;
+        }
+
+        let mut w = self.search_level(query, ep, ef, 0);
+
+        let mut res = Vec::with_capacity(k);
+        while res.len() < k && !w.is_empty() {
+            let c = w.pop().unwrap();
+            let cr = c.read();
+            let cnr = cr.node.read();
+            res.push(SearchResult::new(cr.sim, &cnr.name, &cnr.data));
+        }
+        res
     }
 }
