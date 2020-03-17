@@ -42,11 +42,32 @@ impl fmt::Display for HNSWRedisMode {
 
 type NodeRef<T> = Arc<RwLock<_Node<T>>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct _Node<T> {
     pub name: String,
     pub data: Vec<T>,
     pub neighbors: Vec<Vec<Node<T>>>,
+}
+
+impl<T: fmt::Debug> fmt::Debug for _Node<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "name: {}\n\
+             data: {:?}\n\
+             neighbors: {:?}\n",
+            self.name,
+            self.data,
+            self.neighbors
+                .iter()
+                .map(|l| {
+                    l.into_iter()
+                        .map(|n| n.read().name.to_owned())
+                        .collect::<Vec<String>>()
+                })
+                .collect::<Vec<Vec<String>>>(),
+        )
+    }
 }
 
 impl<T> _Node<T> {
@@ -207,7 +228,7 @@ impl Index {
     }
 }
 
-impl fmt::Display for Index {
+impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -220,7 +241,7 @@ impl fmt::Display for Index {
              level_mult: {}\n\
              node_count: {:?}\n\
              max_layer: {:?}\n\
-             enterpoint: {:?}\n",
+             enterpoint: {}\n",
             self.name,
             self.mode,
             self.mfunc_kind,
@@ -230,7 +251,10 @@ impl fmt::Display for Index {
             self.level_mult,
             self.node_count,
             self.max_layer,
-            self.enterpoint,
+            match &self.enterpoint {
+                Some(node) => node.read().name.clone(),
+                None => "None".to_owned(),
+            },
         )
     }
 }
@@ -291,6 +315,7 @@ impl Index {
                 Node::new(name, data.to_owned(), self.m_max),
             );
         }
+        self.node_count += 1;
 
         let query = self.nodes.get(name).unwrap();
         let mut ep = self.enterpoint.as_ref().unwrap().clone();

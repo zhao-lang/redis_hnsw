@@ -16,12 +16,13 @@ use redis_module::{
 };
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 
 static PREFIX: &str = "hnsw";
 
 lazy_static! {
-    static ref INDICES: Mutex<HashMap<String, Mutex<Index>>> = Mutex::new(HashMap::new());
+    static ref INDICES: Arc<RwLock<HashMap<String, Arc<RwLock<Index>>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 }
 
 fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -47,7 +48,7 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
             .try_into()
             .unwrap_or(data_dim);
     }
-    let mut m = 16;
+    let mut m = 5;
     if args.len() > 4 {
         m = parse_unsigned_integer(&args[4])?.try_into().unwrap_or(m);
     }
@@ -60,7 +61,7 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     // create index
     let index = Index::new(&index_name, index_mode, data_dim, m, ef_construction);
-    ctx.log_debug(format!("{:#}", index).as_str());
+    ctx.log_debug(format!("{:?}", index).as_str());
 
     // write to redis
     ctx.auto_memory();
@@ -81,9 +82,9 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     // Add index to global hashmap
     INDICES
-        .lock()
+        .write()
         .unwrap()
-        .insert(index_name.clone(), Mutex::new(index));
+        .insert(index_name.clone(), Arc::new(RwLock::new(index)));
 
     Ok(index_name.into())
 }
@@ -96,23 +97,20 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     let index_name = format!("{}.{}", PREFIX, &args[1]);
 
     // get index from global hashmap
-    let indices = INDICES.lock().unwrap();
+    let indices = INDICES.read().unwrap();
     let index = indices
         .get(&index_name)
         .ok_or_else(|| format!("Index: {} does not exists", &args[1]))?
-        .lock()
+        .read()
         .unwrap();
-    ctx.log_debug(format!("{:#}", index).as_str());
+    ctx.log_debug(format!("{:?}", index).as_str());
 
     // get index from redis
     ctx.log_debug(format!("get key: {}", &index.name).as_str());
     let rkey = ctx.open_key(&index.name);
 
     let output: String = match rkey.get_value::<Index>(&types::HNSW_INDEX_REDIS_TYPE)? {
-        Some(value) => {
-            // ctx.log_debug(format!("{:#}", value).as_str());
-            format!("{:#}", value).as_str().into()
-        }
+        Some(value) => format!("{:?}", value).as_str().into(),
         None => String::from(""),
     };
 
@@ -134,23 +132,37 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let data = dataf64.into_iter().map(|d| *d as f32).collect::<Vec<f32>>();
 
     // update index in global hashmap
-    let indices = INDICES.lock().unwrap();
+    let indices = INDICES.read().unwrap();
     let mut index = indices
         .get(index_name.as_str())
         .ok_or_else(|| format!("Index: {} does not exists", index_name))?
-        .lock()
+        .write()
         .unwrap();
     ctx.log_debug(format!("Adding node: {} to Index: {}", &node_name, &index_name).as_str());
-    index.add_node(&node_name, &data).unwrap();
+    index
+        .add_node(&node_name, &data)
+        .unwrap_or_else(|e| ctx.log_debug(format!("{:?}", e).as_str()));
 
     // write node to redis
     let node = index.nodes.get(&node_name).unwrap();
-    write_node(ctx, &node_name, node.into()).unwrap();
+    write_node(ctx, &node_name, node.into())?;
 
     let index_nodes = format!("{}.{}", index_name, "nodeset");
     ctx.call("SADD", &[&index_nodes, &node_name])?;
 
     Ok(node_name.into())
+}
+
+fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
+    if args.len() < 2 {
+        return Err(RedisError::WrongArity);
+    }
+
+    let index_name = format!("{}.{}", PREFIX, &args[1]);
+    let indices = INDICES.read().unwrap();
+    ctx.log_debug(format!("{:?}", indices).as_str());
+
+    Ok(index_name.into())
 }
 
 pub fn hnsw_node_set(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -206,7 +218,8 @@ redis_module! {
     commands: [
         ["hnsw.new", new_index, ""],
         ["hnsw.get", get_index, ""],
-        ["hnsw.addnode", add_node, ""],
+        ["hnsw.node.add", add_node, ""],
+        ["hnsw.node.search", search_knn, ""],
         ["hnsw.node.set", hnsw_node_set, ""],
         ["hnsw.node.get", hnsw_node_get, ""],
     ],
