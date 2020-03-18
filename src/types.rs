@@ -7,7 +7,7 @@ use super::hnsw::{Index, Node};
 
 pub static HNSW_INDEX_REDIS_TYPE: RedisType = RedisType::new(
     "hnswindex",
-    1,
+    0,
     raw::RedisModuleTypeMethods {
         version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
         rdb_load: None,
@@ -55,7 +55,7 @@ impl From<&Node<f32>> for NodeRedis {
 
 pub static HNSW_NODE_REDIS_TYPE: RedisType = RedisType::new(
     "hnswnodet",
-    1,
+    0,
     raw::RedisModuleTypeMethods {
         version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
         rdb_load: None,

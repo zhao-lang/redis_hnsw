@@ -1,13 +1,14 @@
 use super::metrics;
 
 use ordered_float::OrderedFloat;
-use owning_ref::{RefMutRefMut, RefRef, RwLockReadGuardRef, RwLockWriteGuardRefMut};
+use owning_ref::{RefMutRefMut, RefRef, RwLockReadGuardRef};
 use rand::prelude::*;
 use std::cell::RefCell;
 use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::{clone, fmt};
 
 #[derive(Debug)]
@@ -31,18 +32,6 @@ impl From<String> for HNSWError {
 impl HNSWError {
     pub fn error_string(&self) -> String {
         format!("{:?}", self)
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum HNSWRedisMode {
-    Source,
-    Storage,
-}
-
-impl fmt::Display for HNSWRedisMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", format!("{:?}", self).to_uppercase())
     }
 }
 
@@ -141,9 +130,9 @@ impl<T: std::clone::Clone> Node<T> {
         RwLockReadGuardRef::new(self.0.try_read().unwrap())
     }
 
-    pub fn write(&self) -> RwLockWriteGuardRefMut<_Node<T>> {
-        RwLockWriteGuardRefMut::new(self.0.try_write().unwrap())
-    }
+    // pub fn write(&self) -> RwLockWriteGuardRefMut<_Node<T>> {
+    //     RwLockWriteGuardRefMut::new(self.0.try_write().unwrap())
+    // }
 
     fn push_levels(&self, level: usize) {
         let mut node = self.0.try_write().unwrap();
@@ -217,7 +206,6 @@ impl<T: std::clone::Clone> Ord for SimPair<T> {
 
 pub struct Index {
     pub name: String,                          // index name
-    pub mode: HNSWRedisMode,                   // redis mode
     pub mfunc: Box<metrics::MetricFuncT<f32>>, // metric function
     pub mfunc_kind: metrics::MetricFuncs,      // kind of the metric function
     pub data_dim: usize,                       // dimensionality of the data
@@ -234,16 +222,9 @@ pub struct Index {
 }
 
 impl Index {
-    pub fn new(
-        name: &str,
-        mode: HNSWRedisMode,
-        data_dim: usize,
-        m: usize,
-        ef_construction: usize,
-    ) -> Self {
+    pub fn new(name: &str, data_dim: usize, m: usize, ef_construction: usize) -> Self {
         Index {
             name: name.to_string(),
-            mode: mode,
             mfunc: Box::new(metrics::euclidean),
             mfunc_kind: metrics::MetricFuncs::Euclidean,
             data_dim: data_dim,
@@ -266,7 +247,6 @@ impl fmt::Debug for Index {
         write!(
             f,
             "name: {}\n\
-             mode: {}\n\
              metric: {:?}\n\
              data_dim: {}\n\
              M: {}\n\
@@ -276,7 +256,6 @@ impl fmt::Debug for Index {
              max_layer: {:?}\n\
              enterpoint: {}\n",
             self.name,
-            self.mode,
             self.mfunc_kind,
             self.data_dim,
             self.m,
@@ -296,7 +275,6 @@ impl clone::Clone for Index {
     fn clone(&self) -> Self {
         Index {
             name: self.name.clone(),
-            mode: self.mode,
             mfunc: self.mfunc.clone(),
             mfunc_kind: self.mfunc_kind,
             data_dim: self.data_dim,
@@ -315,7 +293,12 @@ impl clone::Clone for Index {
 }
 
 impl Index {
-    pub fn add_node(&mut self, name: &str, data: &[f32]) -> Result<(), HNSWError> {
+    pub fn add_node<'a>(
+        &mut self,
+        name: &str,
+        data: &[f32],
+        update_fn: fn(String, Node<f32>),
+    ) -> Result<(), HNSWError> {
         if data.len() != self.data_dim {
             return Err(format!("data dimension: {} does not match Index", data.len()).into());
         }
@@ -333,7 +316,7 @@ impl Index {
             return Err(format!("Node: {:?} already exists", name).into());
         }
 
-        self.insert(name, data)
+        self.insert(name, data, update_fn)
     }
 
     pub fn search_knn(&self, data: &[f32], k: usize) -> Result<Vec<SearchResult<f32>>, HNSWError> {
@@ -348,7 +331,12 @@ impl Index {
     }
 
     // perform insertion of new nodes into the index
-    fn insert(&mut self, name: &str, data: &[f32]) -> Result<(), HNSWError> {
+    fn insert<'a>(
+        &mut self,
+        name: &str,
+        data: &[f32],
+        update_fn: fn(String, Node<f32>),
+    ) -> Result<(), HNSWError> {
         let l = self.gen_random_level();
         let l_max = self.max_layer;
 
@@ -381,6 +369,14 @@ impl Index {
             w = self.search_level(data, ep.clone(), self.ef_construction, lc);
             let mut neighbors = self.select_neighbors(query, &w, self.m, lc, true, true, None);
             self.connect_neighbors(query, &neighbors, lc);
+
+            // update nodes on redis
+            for npair in &neighbors {
+                let npr = npair.read();
+                let node = npr.node.clone();
+                let name = node.read().name.clone();
+                let _ = thread::spawn(move || update_fn(name, node));
+            }
 
             // shrink connections as needed
             while !neighbors.is_empty() {
