@@ -130,10 +130,6 @@ impl<T: std::clone::Clone> Node<T> {
         RwLockReadGuardRef::new(self.0.try_read().unwrap())
     }
 
-    // pub fn write(&self) -> RwLockWriteGuardRefMut<_Node<T>> {
-    //     RwLockWriteGuardRefMut::new(self.0.try_write().unwrap())
-    // }
-
     fn push_levels(&self, level: usize) {
         let mut node = self.0.try_write().unwrap();
         node.push_levels(level);
@@ -293,7 +289,7 @@ impl clone::Clone for Index {
 }
 
 impl Index {
-    pub fn add_node<'a>(
+    pub fn add_node(
         &mut self,
         name: &str,
         data: &[f32],
@@ -319,6 +315,25 @@ impl Index {
         self.insert(name, data, update_fn)
     }
 
+    pub fn delete_node(
+        &mut self,
+        name: &str,
+        update_fn: fn(String, Node<f32>),
+    ) -> Result<(), HNSWError> {
+        let node = match self.nodes.remove(name) {
+            Some(node) => node,
+            None => return Err(format!("Node: {:?} does not exist", name).into()),
+        };
+        self.node_count -= 1;
+
+        let nr = node.read();
+        for lc in 0..nr.neighbors.len() {
+            self.delete_node_from_neighbors(&node, lc, update_fn);
+        }
+
+        Ok(())
+    }
+
     pub fn search_knn(&self, data: &[f32], k: usize) -> Result<Vec<SearchResult<f32>>, HNSWError> {
         if data.len() != self.data_dim {
             return Err(format!("data dimension: {} does not match Index", data.len()).into());
@@ -331,7 +346,7 @@ impl Index {
     }
 
     // perform insertion of new nodes into the index
-    fn insert<'a>(
+    fn insert(
         &mut self,
         name: &str,
         data: &[f32],
@@ -608,6 +623,43 @@ impl Index {
         while !conn.is_empty() {
             let newpair = conn.pop().unwrap();
             node.add_neighbor(level, newpair.read().node.clone());
+        }
+    }
+
+    fn delete_node_from_neighbors(
+        &self,
+        node: &Node<f32>,
+        lc: usize,
+        update_fn: fn(String, Node<f32>),
+    ) {
+        let r = node.read();
+        let neighbors = &r.neighbors[lc];
+
+        for n in neighbors {
+            let nnewconn: BinaryHeap<SimPair<f32>>;
+            {
+                let nr = n.read();
+                let nneighbors = &nr.neighbors[lc];
+                let mut nconn = BinaryHeap::with_capacity(nneighbors.len());
+
+                for nn in nneighbors {
+                    let nnsim =
+                        OrderedFloat::from((self.mfunc)(&nr.data, &nn.read().data, self.data_dim));
+                    let nnpair = SimPair::new(nnsim, nn.to_owned());
+                    nconn.push(nnpair);
+                }
+
+                let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
+                nnewconn = self.select_neighbors(n, &nconn, m_max, lc, true, true, Some(node));
+            }
+            self.update_node_connections(n, &nnewconn, lc);
+        }
+
+        // update nodes on redis
+        for n in neighbors {
+            let name = n.read().name.clone();
+            let node = n.clone();
+            let _ = thread::spawn(move || update_fn(name, node));
         }
     }
 
