@@ -331,6 +331,30 @@ impl Index {
             self.delete_node_from_neighbors(&node, lc, update_fn);
         }
 
+        // update enterpoint if necessary
+        if self.node_count == 0 {
+            self.enterpoint = None;
+        }
+        match &self.enterpoint {
+            Some(ep) if node == *ep => {
+                let mut new_ep = None;
+                let mut lc = self.max_layer;
+                loop {
+                    if nr.neighbors[lc].len() > 0 {
+                        new_ep = Some(nr.neighbors[lc][0].clone());
+                        break;
+                    }
+                    if lc == 0 {
+                        break;
+                    }
+                    lc -= 1;
+                    self.max_layer -= 1;
+                }
+                self.enterpoint = new_ep;
+            }
+            _ => (),
+        }
+
         Ok(())
     }
 

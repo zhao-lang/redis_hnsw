@@ -160,7 +160,7 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     Ok(node_name.into())
 }
 
-// TODO handle deletion of enterpoint
+// TODO figure out why some deleted nodes reappear as it's own neighbor
 fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     if args.len() < 3 {
         return Err(RedisError::WrongArity);
@@ -183,7 +183,6 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     ctx.log_debug(format!("del key: {}", &node_name).as_str());
     let rkey = ctx.open_key_writable(&node_name);
-
     match rkey.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
         Some(_) => rkey.delete()?,
         None => {
@@ -193,6 +192,10 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
             )));
         }
     };
+
+    // update nodeset
+    let index_nodes = format!("{}.{}", index_name, "nodeset");
+    ctx.call("SREM", &[&index_nodes, &node_name])?;
 
     // update index
     let key = ctx.open_key_writable(&index_name);
@@ -208,8 +211,6 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
             )));
         }
     }
-
-    // update nodeset
 
     Ok(1_usize.into())
 }
