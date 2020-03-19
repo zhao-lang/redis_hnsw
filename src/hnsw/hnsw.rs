@@ -87,22 +87,26 @@ impl<T: fmt::Debug + std::clone::Clone> fmt::Debug for _Node<T> {
 }
 
 impl<T: std::clone::Clone> _Node<T> {
-    fn push_levels(&mut self, level: usize) {
+    fn push_levels(&mut self, level: usize, capacity: Option<usize>) {
         let neighbors = &mut self.neighbors;
         while neighbors.len() < level + 1 {
-            neighbors.push(Vec::new());
+            match capacity {
+                Some(cap) => neighbors.push(Vec::with_capacity(cap)),
+                None => neighbors.push(Vec::new()),
+            }
         }
     }
 
-    fn add_neighbor(&mut self, level: usize, neighbor: Node<T>) {
-        self.push_levels(level);
+    fn add_neighbor(&mut self, level: usize, neighbor: Node<T>, capacity: Option<usize>) {
+        self.push_levels(level, capacity);
         let neighbors = &mut self.neighbors;
         neighbors[level].push(neighbor);
     }
 
     fn clear_neighbors(&mut self, level: usize) {
         let neighbors = &mut self.neighbors;
-        neighbors[level] = Vec::new();
+        let cap = neighbors[level].capacity();
+        neighbors[level] = Vec::with_capacity(cap);
     }
 }
 
@@ -139,14 +143,14 @@ impl<T: std::clone::Clone> Node<T> {
         RwLockReadGuardRef::new(self.0.try_read().unwrap())
     }
 
-    fn push_levels(&self, level: usize) {
+    fn push_levels(&self, level: usize, capacity: Option<usize>) {
         let mut node = self.0.try_write().unwrap();
-        node.push_levels(level);
+        node.push_levels(level, capacity);
     }
 
-    fn add_neighbor(&self, level: usize, neighbor: Node<T>) {
+    fn add_neighbor(&self, level: usize, neighbor: Node<T>, capacity: Option<usize>) {
         let node = &mut self.0.try_write().unwrap();
-        node.add_neighbor(level, neighbor);
+        node.add_neighbor(level, neighbor, capacity);
     }
 
     fn clear_neighbors(&self, level: usize) {
@@ -506,7 +510,7 @@ impl Index {
         ef: usize,
         level: usize,
     ) -> BinaryHeap<SimPair<f32>> {
-        let mut v = HashSet::new();
+        let mut v = HashSet::with_capacity(ef);
 
         {
             v.insert(ep.clone());
@@ -534,7 +538,7 @@ impl Index {
 
             // update C and W
             {
-                cpair.write().node.push_levels(level);
+                cpair.write().node.push_levels(level, Some(self.m_max_0));
             }
             let cpr = cpair.read();
             let neighbors = &cpr.node.read().neighbors[level];
@@ -586,7 +590,7 @@ impl Index {
         if extend_candidates {
             let mut ccopy = c.clone();
 
-            let mut v = HashSet::new();
+            let mut v = HashSet::with_capacity(ccopy.capacity());
             while !ccopy.is_empty() {
                 let epair = ccopy.pop().unwrap();
                 v.insert(epair.read().node.clone());
@@ -663,8 +667,9 @@ impl Index {
             let npair = neighbors.pop().unwrap();
             let npr = npair.read();
 
-            query.add_neighbor(level, npr.node.clone());
-            npr.node.add_neighbor(level, query.clone());
+            query.add_neighbor(level, npr.node.clone(), Some(self.m_max_0));
+            npr.node
+                .add_neighbor(level, query.clone(), Some(self.m_max_0));
         }
     }
 
@@ -678,9 +683,12 @@ impl Index {
         node.clear_neighbors(level);
         while !conn.is_empty() {
             let newpair = conn.pop().unwrap();
-            node.add_neighbor(level, newpair.read().node.clone());
+            node.add_neighbor(level, newpair.read().node.clone(), Some(self.m_max_0));
         }
     }
+
+    // TODO revisit this logic, some connections are not getting deleted
+    // (or maybe some connections are not bidirectional?)
     fn delete_node_from_neighbors(
         &self,
         node: &Node<f32>,

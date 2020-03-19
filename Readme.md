@@ -5,6 +5,7 @@
 ## Getting Started
 
 Build the module - `cargo build`
+
 Load the module - `redis-server --loadmodule ./target/<build_mode>/libredis_hnsw.<dylib|so>`
 
 ### Redis commands

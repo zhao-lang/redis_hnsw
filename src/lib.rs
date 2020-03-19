@@ -162,7 +162,6 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     Ok(node_name.into())
 }
 
-// TODO figure out why some deleted nodes reappear as it's own neighbor
 fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     if args.len() < 3 {
         return Err(RedisError::WrongArity);
