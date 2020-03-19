@@ -91,7 +91,9 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
         .ok_or_else(|| format!("Index: {} does not exist", &args[1]))?
         .read()
         .unwrap();
-    ctx.log_debug(format!("{:?}", index).as_str());
+    ctx.log_debug(format!("Index: {:?}", index).as_str());
+    ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
+    ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
 
     // get index from redis
     ctx.log_debug(format!("get key: {}", &index.name).as_str());

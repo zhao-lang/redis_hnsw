@@ -6,6 +6,7 @@ use rand::prelude::*;
 use std::cell::RefCell;
 use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -116,6 +117,14 @@ impl<T: std::clone::Clone> PartialEq for Node<T> {
     }
 }
 
+impl<T: std::clone::Clone> Eq for Node<T> {}
+
+impl<T: std::clone::Clone> Hash for Node<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.read().name.hash(state);
+    }
+}
+
 impl<T: std::clone::Clone> Node<T> {
     fn new(name: &str, data: &[T], capacity: usize) -> Self {
         let node = _Node {
@@ -212,6 +221,7 @@ pub struct Index {
     pub level_mult: f64,                       // level generation factor
     pub node_count: usize,                     // count of nodes
     pub max_layer: usize,                      // idx of top layer
+    pub layers: Vec<HashSet<Node<f32>>>,       // distinct nodes in each layer
     pub nodes: HashMap<String, Node<f32>>,     // hashmap of nodes
     pub enterpoint: Option<Node<f32>>,         // string key to the enterpoint node
     rng_: StdRng,                              // rng for level generation
@@ -231,6 +241,7 @@ impl Index {
             level_mult: 1.0 / (1.0 * m as f64).ln(),
             node_count: 0,
             max_layer: 0,
+            layers: Vec::new(),
             nodes: HashMap::new(),
             enterpoint: None,
             rng_: StdRng::from_entropy(),
@@ -281,7 +292,8 @@ impl clone::Clone for Index {
             level_mult: self.level_mult,
             node_count: self.node_count,
             max_layer: self.max_layer,
-            nodes: HashMap::new(), // blank map for now, rehydrate nodes from node set in redis
+            layers: self.layers.clone(),
+            nodes: self.nodes.clone(),
             enterpoint: self.enterpoint.clone(),
             rng_: self.rng_.clone(),
         }
@@ -302,6 +314,11 @@ impl Index {
         if self.node_count == 0 {
             let node = Node::new(name, data, self.m_max_0);
             self.enterpoint = Some(node.clone());
+
+            let mut layer = HashSet::new();
+            layer.insert(node.clone());
+            self.layers.push(layer);
+
             self.nodes.insert(name.to_owned(), node);
             self.node_count += 1;
 
@@ -326,6 +343,12 @@ impl Index {
         };
         self.node_count -= 1;
 
+        for lc in (0..(self.max_layer + 1)).rev() {
+            if self.layers[lc].remove(&node) {
+                break;
+            }
+        }
+
         let nr = node.read();
         for lc in 0..nr.neighbors.len() {
             self.delete_node_from_neighbors(&node, lc, update_fn);
@@ -338,17 +361,18 @@ impl Index {
         match &self.enterpoint {
             Some(ep) if node == *ep => {
                 let mut new_ep = None;
-                let mut lc = self.max_layer;
-                loop {
-                    if nr.neighbors[lc].len() > 0 {
-                        new_ep = Some(nr.neighbors[lc][0].clone());
-                        break;
+                for lc in (0..(self.max_layer + 1)).rev() {
+                    match self.layers[lc].iter().next() {
+                        Some(n) => {
+                            new_ep = Some(n.clone());
+                            break;
+                        }
+                        None => {
+                            self.layers.pop();
+                            self.max_layer -= 1;
+                            continue;
+                        }
                     }
-                    if lc == 0 {
-                        break;
-                    }
-                    lc -= 1;
-                    self.max_layer -= 1;
                 }
                 self.enterpoint = new_ep;
             }
@@ -458,7 +482,13 @@ impl Index {
         if l > l_max {
             self.max_layer = l;
             self.enterpoint = Some(query.to_owned());
+            while self.layers.len() < l + 1 {
+                self.layers.push(HashSet::new());
+            }
         }
+
+        // add node to layer set
+        self.layers[l].insert(query.to_owned());
 
         Ok(())
     }
@@ -479,7 +509,7 @@ impl Index {
         let mut v = HashSet::new();
 
         {
-            v.insert(ep.read().name.to_owned());
+            v.insert(ep.clone());
         }
         let qsim: OrderedFloat<f32>;
         {
@@ -509,12 +539,15 @@ impl Index {
             let cpr = cpair.read();
             let neighbors = &cpr.node.read().neighbors[level];
             for neighbor in neighbors {
-                let nr = neighbor.read();
-                if !v.contains(&nr.name) {
-                    v.insert(nr.name.clone());
+                if !v.contains(&neighbor) {
+                    v.insert(neighbor.clone());
 
                     fpair = w.peek().unwrap();
-                    let esim = OrderedFloat::from((self.mfunc)(query, &nr.data, self.data_dim));
+                    let esim = OrderedFloat::from((self.mfunc)(
+                        query,
+                        &neighbor.read().data,
+                        self.data_dim,
+                    ));
                     if esim > fpair.0.read().sim || w.len() < ef {
                         let epair = SimPair::new(esim, neighbor.clone());
                         c.push(epair.clone());
@@ -556,7 +589,7 @@ impl Index {
             let mut v = HashSet::new();
             while !ccopy.is_empty() {
                 let epair = ccopy.pop().unwrap();
-                v.insert(epair.read().node.read().name.clone());
+                v.insert(epair.read().node.clone());
             }
 
             ccopy = c.clone();
@@ -570,16 +603,15 @@ impl Index {
                         continue;
                     }
 
-                    let enr = eneighbor.read();
-                    if !v.contains(&enr.name) {
+                    if !v.contains(&eneighbor) {
                         let ensim = OrderedFloat::from((self.mfunc)(
                             &query.read().data,
-                            &enr.data,
+                            &eneighbor.read().data,
                             self.data_dim,
                         ));
                         let enpair = SimPair::new(ensim, eneighbor.clone());
                         w.push(enpair);
-                        v.insert(enr.name.clone());
+                        v.insert(eneighbor.clone());
                     }
                 }
             }
@@ -649,7 +681,6 @@ impl Index {
             node.add_neighbor(level, newpair.read().node.clone());
         }
     }
-
     fn delete_node_from_neighbors(
         &self,
         node: &Node<f32>,

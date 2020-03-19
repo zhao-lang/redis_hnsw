@@ -14,7 +14,7 @@ pub type MetricFuncT<T> = fn(&[T], &[T], usize) -> f32;
 pub fn euclidean(v1: &[f32], v2: &[f32], n: usize) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // TODO remove the check on array length
+        // TODO remove the check on array length with more flexible avx func
         if is_x86_feature_detected!("avx2") && v1.len() % 32 == 0 {
             return sim_func_avx_euc(v1, v2, n);
         }
