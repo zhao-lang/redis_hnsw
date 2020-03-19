@@ -100,14 +100,25 @@ impl<T: std::clone::Clone> _Node<T> {
     fn add_neighbor(&mut self, level: usize, neighbor: Node<T>, capacity: Option<usize>) {
         self.push_levels(level, capacity);
         let neighbors = &mut self.neighbors;
-        neighbors[level].push(neighbor);
+        if !neighbors[level].contains(&neighbor) {
+            neighbors[level].push(neighbor);
+        }
     }
 
-    fn clear_neighbors(&mut self, level: usize) {
+    fn rm_neighbor(&mut self, level: usize, neighbor: Node<T>) {
         let neighbors = &mut self.neighbors;
-        let cap = neighbors[level].capacity();
-        neighbors[level] = Vec::with_capacity(cap);
+        let index = neighbors[level]
+            .iter()
+            .position(|n| *n == neighbor)
+            .unwrap();
+        neighbors[level].remove(index);
     }
+
+    // fn clear_neighbors(&mut self, level: usize) {
+    //     let neighbors = &mut self.neighbors;
+    //     let cap = neighbors[level].capacity();
+    //     neighbors[level] = Vec::with_capacity(cap);
+    // }
 }
 
 #[derive(Debug, Clone)]
@@ -153,10 +164,15 @@ impl<T: std::clone::Clone> Node<T> {
         node.add_neighbor(level, neighbor, capacity);
     }
 
-    fn clear_neighbors(&self, level: usize) {
+    fn rm_neighbor(&self, level: usize, neighbor: Node<T>) {
         let node = &mut self.0.try_write().unwrap();
-        node.clear_neighbors(level);
+        node.rm_neighbor(level, neighbor);
     }
+
+    // fn clear_neighbors(&self, level: usize) {
+    //     let node = &mut self.0.try_write().unwrap();
+    //     node.clear_neighbors(level);
+    // }
 }
 
 type SimPairRef<T> = Rc<RefCell<_SimPair<T>>>;
@@ -353,15 +369,23 @@ impl Index {
             }
         }
 
+        let mut updated = HashSet::new();
         let nr = node.read();
         for lc in 0..nr.neighbors.len() {
-            self.delete_node_from_neighbors(&node, lc, update_fn);
+            let up = self.delete_node_from_neighbors(&node, lc);
+            for u in up {
+                updated.insert(u);
+            }
+        }
+
+        // update nodes in redis
+        for n in updated {
+            let name = n.read().name.clone();
+            let node = n.clone();
+            let _ = thread::spawn(move || update_fn(name, node));
         }
 
         // update enterpoint if necessary
-        if self.node_count == 0 {
-            self.enterpoint = None;
-        }
         match &self.enterpoint {
             Some(ep) if node == *ep => {
                 let mut new_ep = None;
@@ -373,7 +397,9 @@ impl Index {
                         }
                         None => {
                             self.layers.pop();
-                            self.max_layer -= 1;
+                            if self.max_layer > 0 {
+                                self.max_layer -= 1;
+                            }
                             continue;
                         }
                     }
@@ -431,18 +457,15 @@ impl Index {
             lc -= 1;
         }
 
-        lc = min(l_max, l);
-        loop {
+        let mut updated = HashSet::new();
+        for lc in (0..(min(l_max, l) + 1)).rev() {
             w = self.search_level(data, ep.clone(), self.ef_construction, lc);
             let mut neighbors = self.select_neighbors(query, &w, self.m, lc, true, true, None);
             self.connect_neighbors(query, &neighbors, lc);
 
-            // update nodes on redis
+            // add node to list of nodes to be updated in redis
             for npair in &neighbors {
-                let npr = npair.read();
-                let node = npr.node.clone();
-                let name = node.read().name.clone();
-                let _ = thread::spawn(move || update_fn(name, node));
+                updated.insert(npair.read().node.clone());
             }
 
             // shrink connections as needed
@@ -470,16 +493,21 @@ impl Index {
                 if econn.len() > m_max {
                     let enewconn =
                         self.select_neighbors(&er.node, &econn, m_max, lc, true, true, None);
-                    self.update_node_connections(&er.node, &enewconn, lc);
+                    let up = self.update_node_connections(&er.node, &enewconn, &econn, lc, None);
+                    for u in up {
+                        updated.insert(u);
+                    }
                 }
             }
 
             ep = w.peek().unwrap().read().node.clone();
+        }
 
-            if lc == 0 {
-                break;
-            }
-            lc -= 1;
+        // update nodes in redis
+        for n in updated {
+            let name = n.read().name.clone();
+            let node = n.clone();
+            let _ = thread::spawn(move || update_fn(name, node));
         }
 
         // new enterpoint if we're in a higher layer
@@ -676,34 +704,66 @@ impl Index {
     fn update_node_connections(
         &self,
         node: &Node<f32>,
-        conn: &BinaryHeap<SimPair<f32>>,
+        new_neighbors: &BinaryHeap<SimPair<f32>>,
+        old_neighbors: &BinaryHeap<SimPair<f32>>,
         level: usize,
-    ) {
-        let mut conn = conn.clone();
-        node.clear_neighbors(level);
-        while !conn.is_empty() {
-            let newpair = conn.pop().unwrap();
-            node.add_neighbor(level, newpair.read().node.clone(), Some(self.m_max_0));
+        ignored_node: Option<&Node<f32>>,
+    ) -> HashSet<Node<f32>> {
+        let mut newconn = new_neighbors.clone();
+        let mut rmconn = old_neighbors.clone().into_vec();
+        let mut updated = HashSet::new();
+        updated.insert(node.clone());
+
+        // bidirectionally connect new neighbors
+        while !newconn.is_empty() {
+            let newpair = newconn.pop().unwrap();
+            let npr = newpair.read();
+            node.add_neighbor(level, npr.node.clone(), Some(self.m_max_0));
+            npr.node
+                .add_neighbor(level, node.clone(), Some(self.m_max_0));
+            updated.insert(npr.node.clone());
+            // if new neighbor exists in the old set then we remove it from
+            // the set of neighbors to be removed
+            match rmconn.iter().position(|n| n.read().node == npr.node) {
+                Some(index) => {
+                    rmconn.remove(index);
+                }
+                None => (),
+            }
         }
+
+        // bidirectionally remove old connections
+        while !rmconn.is_empty() {
+            let rmpair = rmconn.pop().unwrap();
+            let rmpr = rmpair.read();
+            node.rm_neighbor(level, rmpr.node.clone());
+            // if node to be removed is the ignored node then pass
+            match ignored_node {
+                Some(n) if rmpr.node == *n => {
+                    continue;
+                }
+                _ => {
+                    rmpr.node.rm_neighbor(level, node.clone());
+                    updated.insert(rmpr.node.clone());
+                }
+            }
+        }
+
+        updated
     }
 
-    // TODO revisit this logic, some connections are not getting deleted
-    // (or maybe some connections are not bidirectional?)
-    fn delete_node_from_neighbors(
-        &self,
-        node: &Node<f32>,
-        lc: usize,
-        update_fn: fn(String, Node<f32>),
-    ) {
+    fn delete_node_from_neighbors(&self, node: &Node<f32>, lc: usize) -> HashSet<Node<f32>> {
         let r = node.read();
         let neighbors = &r.neighbors[lc];
+        let mut updated = HashSet::new();
 
         for n in neighbors {
             let nnewconn: BinaryHeap<SimPair<f32>>;
+            let mut nconn: BinaryHeap<SimPair<f32>>;
             {
                 let nr = n.read();
                 let nneighbors = &nr.neighbors[lc];
-                let mut nconn = BinaryHeap::with_capacity(nneighbors.len());
+                nconn = BinaryHeap::with_capacity(nneighbors.len());
 
                 for nn in nneighbors {
                     let nnsim =
@@ -715,15 +775,14 @@ impl Index {
                 let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
                 nnewconn = self.select_neighbors(n, &nconn, m_max, lc, true, true, Some(node));
             }
-            self.update_node_connections(n, &nnewconn, lc);
+            updated.insert(n.clone());
+            let up = self.update_node_connections(n, &nnewconn, &nconn, lc, Some(node));
+            for u in up {
+                updated.insert(u);
+            }
         }
 
-        // update nodes on redis
-        for n in neighbors {
-            let name = n.read().name.clone();
-            let node = n.clone();
-            let _ = thread::spawn(move || update_fn(name, node));
-        }
+        updated
     }
 
     fn search_knn_internal(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult<f32>> {
