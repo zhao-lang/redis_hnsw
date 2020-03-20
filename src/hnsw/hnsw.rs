@@ -36,7 +36,6 @@ impl HNSWError {
     }
 }
 
-#[derive(Debug)]
 pub struct SearchResult<T> {
     pub sim: OrderedFloat<f32>,
     pub name: String,
@@ -50,6 +49,25 @@ impl<T: std::clone::Clone> SearchResult<T> {
             name: name.to_owned(),
             data: data.to_vec(),
         }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for SearchResult<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "sim: {}\n\
+             name: {:?}\n\
+             data: {:?}{}\n",
+            self.sim,
+            self.name,
+            if self.data.len() > 10 {
+                &self.data[..10];
+            } else {
+                &self.data[..];
+            },
+            if self.data.len() > 10 { "+ more" } else { "" }
+        )
     }
 }
 
@@ -234,7 +252,7 @@ pub struct Index {
     pub mfunc: Box<metrics::MetricFuncT<f32>>, // metric function
     pub mfunc_kind: metrics::MetricFuncs,      // kind of the metric function
     pub data_dim: usize,                       // dimensionality of the data
-    pub m: usize,                              // out vertexts per node
+    pub m: usize,                              // out vertexs per node
     pub m_max: usize,                          // max number of vertexes per node
     pub m_max_0: usize,                        // max number of vertexes at layer 0
     pub ef_construction: usize,                // size of dynamic candidate list
@@ -243,7 +261,7 @@ pub struct Index {
     pub max_layer: usize,                      // idx of top layer
     pub layers: Vec<HashSet<Node<f32>>>,       // distinct nodes in each layer
     pub nodes: HashMap<String, Node<f32>>,     // hashmap of nodes
-    pub enterpoint: Option<Node<f32>>,         // string key to the enterpoint node
+    pub enterpoint: Option<Node<f32>>,         // enterpoint node
     rng_: StdRng,                              // rng for level generation
 }
 
@@ -361,6 +379,7 @@ impl Index {
             Some(node) => node,
             None => return Err(format!("Node: {:?} does not exist", name).into()),
         };
+        // self.nodes.shrink_to_fit();
         self.node_count -= 1;
 
         for lc in (0..(self.max_layer + 1)).rev() {
@@ -396,6 +415,7 @@ impl Index {
                             break;
                         }
                         None => {
+                            // self.layers[lc].shrink_to_fit();
                             self.layers.pop();
                             if self.max_layer > 0 {
                                 self.max_layer -= 1;
@@ -404,6 +424,7 @@ impl Index {
                         }
                     }
                 }
+                // self.layers.shrink_to_fit();
                 self.enterpoint = new_ep;
             }
             _ => (),

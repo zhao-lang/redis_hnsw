@@ -56,7 +56,7 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     // write to redis
     let key = ctx.open_key_writable(&index_name);
-    match key.get_value::<Index>(&HNSW_INDEX_REDIS_TYPE)? {
+    match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(_) => {
             return Err(RedisError::String(format!(
                 "Index: {} already exists",
@@ -64,7 +64,7 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
             )));
         }
         None => {
-            key.set_value(&HNSW_INDEX_REDIS_TYPE, index.clone())?;
+            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, (&index).into())?;
         }
     }
 
@@ -99,12 +99,42 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.log_debug(format!("get key: {}", &index.name).as_str());
     let rkey = ctx.open_key(&index.name);
 
-    let output: String = match rkey.get_value::<Index>(&HNSW_INDEX_REDIS_TYPE)? {
+    let output: String = match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(value) => format!("{:?}", value).as_str().into(),
         None => String::from(""),
     };
 
     Ok(output.into())
+}
+
+fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
+    if args.len() < 2 {
+        return Err(RedisError::WrongArity);
+    }
+    {
+        let index_name = format!("{}.{}", PREFIX, &args[1]);
+
+        // get index from global hashmap
+        let mut indices = INDICES.write().unwrap();
+        let rm = indices.remove(&index_name);
+        let index = rm.ok_or_else(|| format!("Index: {} does not exist", &args[1]))?;
+        let index = index.read().unwrap();
+
+        // get index from redis
+        ctx.log_debug(format!("deleting index: {}", &index.name).as_str());
+        let rkey = ctx.open_key_writable(&index.name);
+
+        match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
+            Some(_) => rkey.delete()?,
+            None => {
+                return Err(RedisError::String(format!(
+                    "Index: {} does not exist",
+                    &args[1]
+                )));
+            }
+        };
+    }
+    Ok(1_usize.into())
 }
 
 fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -143,10 +173,10 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     // update index in redis
     let key = ctx.open_key_writable(&index_name);
-    match key.get_value::<Index>(&HNSW_INDEX_REDIS_TYPE)? {
+    match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(_) => {
             ctx.log_debug(format!("update index: {}", &index_name).as_str());
-            key.set_value(&HNSW_INDEX_REDIS_TYPE, index.clone())?;
+            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, (&*index).into())?;
         }
         None => {
             return Err(RedisError::String(format!(
@@ -155,9 +185,6 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
             )));
         }
     }
-
-    let index_nodes = format!("{}.{}", index_name, "nodeset");
-    ctx.call("SADD", &[&index_nodes, &node_name])?;
 
     Ok(node_name.into())
 }
@@ -194,16 +221,12 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
         }
     };
 
-    // update nodeset
-    let index_nodes = format!("{}.{}", index_name, "nodeset");
-    ctx.call("SREM", &[&index_nodes, &node_name])?;
-
     // update index
     let key = ctx.open_key_writable(&index_name);
-    match key.get_value::<Index>(&HNSW_INDEX_REDIS_TYPE)? {
+    match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(_) => {
             ctx.log_debug(format!("update index: {}", &index_name).as_str());
-            key.set_value(&HNSW_INDEX_REDIS_TYPE, index.clone())?;
+            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, (&*index).into())?;
         }
         None => {
             return Err(RedisError::String(format!(
@@ -301,6 +324,7 @@ redis_module! {
     commands: [
         ["hnsw.new", new_index, "write"],
         ["hnsw.get", get_index, "readonly"],
+        ["hnsw.del", delete_index, "write"],
         ["hnsw.search", search_knn, "readonly"],
         ["hnsw.node.add", add_node, "write"],
         ["hnsw.node.get", get_node, "readonly"],
