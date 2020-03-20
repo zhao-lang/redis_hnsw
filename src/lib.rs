@@ -84,25 +84,25 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     let index_name = format!("{}.{}", PREFIX, &args[1]);
 
-    // get index from global hashmap
-    let indices = INDICES.read().unwrap();
-    let index = indices
-        .get(&index_name)
-        .ok_or_else(|| format!("Index: {} does not exist", &args[1]))?
-        .read()
-        .unwrap();
-    ctx.log_debug(format!("Index: {:?}", index).as_str());
-    ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
-    ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
-
     // get index from redis
-    ctx.log_debug(format!("get key: {}", &index.name).as_str());
-    let rkey = ctx.open_key(&index.name);
+    ctx.log_debug(format!("get key: {}", &index_name).as_str());
+    let rkey = ctx.open_key(&index_name);
 
     let output: String = match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(value) => format!("{:?}", value).as_str().into(),
-        None => String::from(""),
+        None => format!("Index: {} does not exist", &args[1]),
     };
+
+    // get index from global hashmap
+    // let indices = INDICES.read().unwrap();
+    // let index = indices
+    //     .get(&index_name)
+    //     .ok_or_else(|| format!("Index: {} does not exist", &args[1]))?
+    //     .read()
+    //     .unwrap();
+    // ctx.log_debug(format!("Index: {:?}", index).as_str());
+    // ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
+    // ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
 
     Ok(output.into())
 }

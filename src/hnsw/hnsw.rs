@@ -310,7 +310,7 @@ impl fmt::Debug for Index {
             self.max_layer,
             match &self.enterpoint {
                 Some(node) => node.read().name.clone(),
-                None => "None".to_owned(),
+                None => "null".to_owned(),
             },
         )
     }
