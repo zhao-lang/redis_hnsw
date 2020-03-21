@@ -10,9 +10,9 @@ extern crate lazy_static;
 extern crate ordered_float;
 extern crate owning_ref;
 
-use hnsw::Index;
+use hnsw::{Index, Node};
 use redis_module::{parse_float, parse_unsigned_integer, Context, RedisError, RedisResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use types::*;
@@ -88,23 +88,82 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.log_debug(format!("get key: {}", &index_name).as_str());
     let rkey = ctx.open_key(&index_name);
 
-    let output: String = match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
-        Some(value) => format!("{:?}", value).as_str().into(),
-        None => format!("Index: {} does not exist", &args[1]),
+    let index_redis = match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
+        Some(index) => index,
+        None => return Err(format!("Index: {} does not exist", &args[1]).into()),
     };
+    let output = format!("{:?}", index_redis);
 
-    // get index from global hashmap
-    // let indices = INDICES.read().unwrap();
-    // let index = indices
-    //     .get(&index_name)
-    //     .ok_or_else(|| format!("Index: {} does not exist", &args[1]))?
-    //     .read()
-    //     .unwrap();
-    // ctx.log_debug(format!("Index: {:?}", index).as_str());
-    // ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
-    // ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
+    // check if index is in global hashmap
+    let mut indices = INDICES.write().unwrap();
+    let index = match indices.get(&index_name) {
+        Some(index) => index.clone(),
+        None => {
+            let index = make_index(ctx, index_redis)?;
+            let index = Arc::new(RwLock::new(index.clone()));
+            indices.insert(index_name.clone(), index.clone());
+            index
+        }
+    };
+    let index = index.read().unwrap();
+    ctx.log_debug(format!("Index: {:?}", index).as_str());
+    ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
+    ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
 
     Ok(output.into())
+}
+
+fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<Index, RedisError> {
+    let mut index: Index = ir.into();
+
+    index.nodes = HashMap::with_capacity(ir.node_count);
+    for node_name in &ir.nodes {
+        let key = ctx.open_key(&node_name);
+
+        let nr = match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
+            Some(n) => n,
+            None => return Err(format!("Node: {} does not exist", node_name).into()),
+        };
+        let node = Node::new(node_name, &nr.data, index.m_max_0);
+        index.nodes.insert(node_name.to_owned(), node);
+    }
+
+    for node_name in &ir.nodes {
+        let target = index.nodes.get(node_name).unwrap();
+
+        let key = ctx.open_key(&node_name);
+
+        let nr = match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
+            Some(n) => n,
+            None => return Err(format!("Node: {} does not exist", node_name).into()),
+        };
+        for layer in &nr.neighbors {
+            let mut node_layer = Vec::with_capacity(layer.len());
+            for neighbor in layer {
+                let nn = match index.nodes.get(neighbor) {
+                    Some(node) => node,
+                    None => return Err(format!("Node: {} does not exist", node_name).into()),
+                };
+                node_layer.push(nn.clone());
+            }
+            target.write().neighbors.push(node_layer);
+        }
+    }
+
+    // TODO rehydrate index.layers
+    for layer in &ir.layers {
+        let mut node_layer = HashSet::with_capacity(layer.len());
+        for node_name in layer {
+            let node = match index.nodes.get(node_name) {
+                Some(n) => n,
+                None => return Err(format!("Node: {} does not exist", node_name).into()),
+            };
+            node_layer.insert(node.clone());
+        }
+        index.layers.push(node_layer);
+    }
+
+    Ok(index)
 }
 
 fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {

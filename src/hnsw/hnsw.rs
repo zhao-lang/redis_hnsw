@@ -1,11 +1,13 @@
 use super::metrics;
+use crate::types;
 
 use ordered_float::OrderedFloat;
-use owning_ref::{RefMutRefMut, RefRef, RwLockReadGuardRef};
+use owning_ref::{RefMutRefMut, RefRef, RwLockReadGuardRef, RwLockWriteGuardRefMut};
 use rand::prelude::*;
 use std::cell::RefCell;
 use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::convert::From;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -159,7 +161,7 @@ impl<T: std::clone::Clone> Hash for Node<T> {
 }
 
 impl<T: std::clone::Clone> Node<T> {
-    fn new(name: &str, data: &[T], capacity: usize) -> Self {
+    pub fn new(name: &str, data: &[T], capacity: usize) -> Self {
         let node = _Node {
             name: name.to_owned(),
             data: data.to_vec(),
@@ -170,6 +172,10 @@ impl<T: std::clone::Clone> Node<T> {
 
     pub fn read(&self) -> RwLockReadGuardRef<_Node<T>> {
         RwLockReadGuardRef::new(self.0.try_read().unwrap())
+    }
+
+    pub fn write(&self) -> RwLockWriteGuardRefMut<_Node<T>> {
+        RwLockWriteGuardRefMut::new(self.0.try_write().unwrap())
     }
 
     fn push_levels(&self, level: usize, capacity: Option<usize>) {
@@ -334,6 +340,35 @@ impl clone::Clone for Index {
             nodes: self.nodes.clone(),
             enterpoint: self.enterpoint.clone(),
             rng_: self.rng_.clone(),
+        }
+    }
+}
+
+impl From<&types::IndexRedis> for Index {
+    fn from(index: &types::IndexRedis) -> Self {
+        Index {
+            name: index.name.clone(),
+            mfunc: match index.mfunc_kind.as_str() {
+                "Euclidean" => Box::new(metrics::euclidean),
+                _ => Box::new(metrics::euclidean),
+            },
+            mfunc_kind: match index.mfunc_kind.as_str() {
+                "Euclidean" => metrics::MetricFuncs::Euclidean,
+                _ => metrics::MetricFuncs::Euclidean,
+            },
+            data_dim: index.data_dim,
+            m: index.m,
+            m_max: index.m_max,
+            m_max_0: index.m_max_0,
+            ef_construction: index.ef_construction,
+            level_mult: index.level_mult,
+            node_count: index.node_count,
+            max_layer: index.max_layer,
+            // the next 3 need to be populated from redis
+            layers: Vec::new(),
+            nodes: HashMap::new(),
+            enterpoint: None,
+            rng_: StdRng::from_entropy(),
         }
     }
 }
