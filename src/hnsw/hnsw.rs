@@ -58,17 +58,22 @@ impl<T: fmt::Debug> fmt::Debug for SearchResult<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "sim: {}\n\
-             name: {:?}\n\
-             data: {:?}{}\n",
+            "sim: {}, \
+             name: {:?}, \
+             data: {:?}{}",
             self.sim,
             self.name,
             if self.data.len() > 10 {
-                &self.data[..10];
+                &self.data[..10]
             } else {
-                &self.data[..];
+                &self.data[..]
             },
-            if self.data.len() > 10 { "+ more" } else { "" }
+            if self.data.len() > 10 {
+                let more = format!(" + {} more", self.data.len() - 10);
+                more
+            } else {
+                "".to_owned()
+            }
         )
     }
 }
@@ -89,9 +94,9 @@ impl<T: fmt::Debug + std::clone::Clone> fmt::Debug for _Node<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "name: {}\n\
-             data: {:?}\n\
-             neighbors: {:?}\n",
+            "name: {}, \
+             data: {:?}, \
+             neighbors: {:?}",
             self.name,
             self.data,
             self.neighbors

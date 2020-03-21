@@ -219,7 +219,7 @@ unsafe extern "C" fn save_index(rdb: *mut raw::RedisModuleIO, value: *mut c_void
     raw::RedisModule_SaveString.unwrap()(rdb, ep.inner);
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct NodeRedis {
     pub data: Vec<f32>,
     pub neighbors: Vec<Vec<String>>, // vector of neighbor node names
@@ -241,6 +241,17 @@ impl From<&Node<f32>> for NodeRedis {
                 })
                 .collect(),
         }
+    }
+}
+
+impl fmt::Debug for NodeRedis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "data: {:?}, \
+             neighbors: {:?}",
+            self.data, self.neighbors,
+        )
     }
 }
 
