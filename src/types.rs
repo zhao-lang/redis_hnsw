@@ -1,10 +1,10 @@
 use redis_module::native_types::RedisType;
-use redis_module::{raw, RedisString};
+use redis_module::{raw, RedisString, RedisValue};
 use std::convert::From;
 use std::os::raw::c_void;
 use std::{fmt, ptr};
 
-use super::hnsw::{Index, Node};
+use super::hnsw::{Index, Node, SearchResult};
 
 static INDEX_VERSION: i32 = 0;
 static NODE_VERSION: i32 = 0;
@@ -87,6 +87,41 @@ impl fmt::Debug for IndexRedis {
                 None => "null",
             },
         )
+    }
+}
+
+impl IndexRedis {
+    pub fn as_redisvalue(&self) -> RedisValue {
+        let mut reply: Vec<RedisValue> = Vec::new();
+
+        reply.push("name".into());
+        reply.push(self.name.as_str().into());
+
+        reply.push("metric".into());
+        reply.push(self.mfunc_kind.as_str().into());
+
+        reply.push("data_dim".into());
+        reply.push(self.data_dim.into());
+
+        reply.push("m".into());
+        reply.push(self.m.into());
+
+        reply.push("ef_construction".into());
+        reply.push(self.ef_construction.into());
+
+        reply.push("level_mult".into());
+        reply.push(self.level_mult.into());
+
+        reply.push("node_count".into());
+        reply.push(self.node_count.into());
+
+        reply.push("max_layer".into());
+        reply.push(self.max_layer.into());
+
+        reply.push("enterpoint".into());
+        reply.push(self.enterpoint.clone().into());
+
+        reply.into()
     }
 }
 
@@ -255,6 +290,38 @@ impl fmt::Debug for NodeRedis {
     }
 }
 
+impl NodeRedis {
+    pub fn as_redisvalue(&self) -> RedisValue {
+        let mut reply: Vec<RedisValue> = Vec::new();
+
+        reply.push("data".into());
+        reply.push(
+            self.data
+                .iter()
+                .map(|x| *x as f64)
+                .collect::<Vec<f64>>()
+                .into(),
+        );
+
+        reply.push("neighbors".into());
+        reply.push(
+            self.neighbors
+                .iter()
+                .map(|layer| {
+                    layer
+                        .iter()
+                        .map(|node| node.into())
+                        .collect::<Vec<RedisValue>>()
+                        .into()
+                })
+                .collect::<Vec<RedisValue>>()
+                .into(),
+        );
+
+        reply.into()
+    }
+}
+
 pub static HNSW_NODE_REDIS_TYPE: RedisType = RedisType::new(
     "hnswnodet",
     NODE_VERSION,
@@ -328,5 +395,34 @@ unsafe extern "C" fn save_node(rdb: *mut raw::RedisModuleIO, value: *mut c_void)
             let s = RedisString::create(ctx, &n);
             raw::RedisModule_SaveString.unwrap()(rdb, s.inner);
         }
+    }
+}
+
+#[derive(Default)]
+pub struct SearchResultRedis {
+    pub sim: f64,
+    pub name: String,
+}
+
+impl From<&SearchResult<f32>> for SearchResultRedis {
+    fn from(res: &SearchResult<f32>) -> Self {
+        SearchResultRedis {
+            sim: res.sim.into_inner() as f64,
+            name: res.name.clone(),
+        }
+    }
+}
+
+impl SearchResultRedis {
+    pub fn as_redisvalue(&self) -> RedisValue {
+        let mut reply: Vec<RedisValue> = Vec::new();
+
+        reply.push("sim".into());
+        reply.push(self.sim.into());
+
+        reply.push("name".into());
+        reply.push(self.name.as_str().into());
+
+        reply.into()
     }
 }

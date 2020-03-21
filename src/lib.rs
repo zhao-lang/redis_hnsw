@@ -11,7 +11,9 @@ extern crate ordered_float;
 extern crate owning_ref;
 
 use hnsw::{Index, Node};
-use redis_module::{parse_float, parse_unsigned_integer, Context, RedisError, RedisResult};
+use redis_module::{
+    parse_float, parse_unsigned_integer, Context, RedisError, RedisResult, RedisValue,
+};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
@@ -72,7 +74,7 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
         }
     }
 
-    Ok(index_name.into())
+    Ok("OK".into())
 }
 
 fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -89,9 +91,8 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
 
     let index_redis: IndexRedis = (&*index).into();
-    let output = format!("{:?}", index_redis);
 
-    Ok(output.into())
+    Ok(index_redis.as_redisvalue().into())
 }
 
 fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -264,7 +265,7 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     // update index in redis
     update_index(ctx, &index_name, &*index)?;
 
-    Ok(node_name.into())
+    Ok("OK".into())
 }
 
 fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -313,11 +314,39 @@ fn get_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let key = ctx.open_key(&node_name);
 
     let value = match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-        Some(value) => format!("{:?}", value).as_str().into(),
-        None => ().into(),
+        Some(node) => node.as_redisvalue().into(),
+        None => {
+            return Err(RedisError::String(format!(
+                "Node: {} does not exist",
+                &node_name
+            )));
+        }
     };
 
     Ok(value)
+}
+
+fn write_node<'a>(ctx: &'a Context, key: &str, node: NodeRedis) -> RedisResult {
+    ctx.log_debug(format!("set key: {}", key).as_str());
+    let rkey = ctx.open_key_writable(key);
+
+    match rkey.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
+        Some(value) => {
+            value.data = node.data;
+            value.neighbors = node.neighbors;
+        }
+        None => {
+            rkey.set_value(&HNSW_NODE_REDIS_TYPE, node)?;
+        }
+    }
+    Ok(key.into())
+}
+
+fn update_node(name: String, node: hnsw::Node<f32>) {
+    let ctx = Context::get_thread_safe_context();
+    ctx.lock();
+    write_node(&ctx, &name, (&node).into()).unwrap();
+    ctx.unlock();
 }
 
 fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
@@ -347,38 +376,17 @@ fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
     match index.search_knn(&data, k) {
         Ok(res) => {
             return {
-                let reply = res
-                    .iter()
-                    .map(|r| format!("{:?}", r))
-                    .collect::<Vec<String>>();
+                let mut reply: Vec<RedisValue> = Vec::new();
+                reply.push(res.len().into());
+                for r in &res {
+                    let sr: SearchResultRedis = r.into();
+                    reply.push(sr.as_redisvalue().into());
+                }
                 Ok(reply.into())
             }
         }
         Err(e) => return Err(e.error_string().into()),
     };
-}
-
-fn write_node<'a>(ctx: &'a Context, key: &str, node: NodeRedis) -> RedisResult {
-    ctx.log_debug(format!("set key: {}", key).as_str());
-    let rkey = ctx.open_key_writable(key);
-
-    match rkey.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-        Some(value) => {
-            value.data = node.data;
-            value.neighbors = node.neighbors;
-        }
-        None => {
-            rkey.set_value(&HNSW_NODE_REDIS_TYPE, node)?;
-        }
-    }
-    Ok(key.into())
-}
-
-fn update_node(name: String, node: hnsw::Node<f32>) {
-    let ctx = Context::get_thread_safe_context();
-    ctx.lock();
-    write_node(&ctx, &name, (&node).into()).unwrap();
-    ctx.unlock();
 }
 
 redis_module! {
