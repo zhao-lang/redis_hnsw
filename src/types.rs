@@ -417,7 +417,7 @@ impl SearchResultRedis {
     pub fn as_redisvalue(&self) -> RedisValue {
         let mut reply: Vec<RedisValue> = Vec::new();
 
-        reply.push("sim".into());
+        reply.push("similarity".into());
         reply.push(self.sim.into());
 
         reply.push("name".into());

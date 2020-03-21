@@ -23,4 +23,4 @@ jobs:
         # Artifact name
         name: build-release
         # Directory containing files to upload
-        path: target/release
+        path: target/release/libredis_hnsw.so

@@ -864,7 +864,11 @@ impl Index {
             let c = w.pop().unwrap();
             let cr = c.read();
             let cnr = cr.node.read();
-            res.push(SearchResult::new(cr.sim, &cnr.name, &cnr.data));
+            res.push(SearchResult::new(
+                cr.sim,
+                (&cnr.name).split(".").collect::<Vec<&str>>()[2],
+                &cnr.data,
+            ));
         }
         res
     }
