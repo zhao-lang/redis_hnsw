@@ -866,7 +866,9 @@ impl Index {
             let cnr = cr.node.read();
             res.push(SearchResult::new(
                 cr.sim,
-                (&cnr.name).split(".").collect::<Vec<&str>>()[2],
+                &((&cnr.name).split(".").collect::<Vec<&str>>())
+                    .last()
+                    .unwrap(),
                 &cnr.data,
             ));
         }
