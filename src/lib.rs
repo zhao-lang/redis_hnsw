@@ -7,6 +7,7 @@ extern crate redis_module;
 #[macro_use]
 extern crate lazy_static;
 
+extern crate num;
 extern crate ordered_float;
 extern crate owning_ref;
 
@@ -21,8 +22,10 @@ use types::*;
 
 static PREFIX: &str = "hnsw";
 
+type IndexArc = Arc<RwLock<Index<f32, f32>>>;
+
 lazy_static! {
-    static ref INDICES: Arc<RwLock<HashMap<String, Arc<RwLock<Index>>>>> =
+    static ref INDICES: Arc<RwLock<HashMap<String, IndexArc>>> =
         Arc::new(RwLock::new(HashMap::new()));
 }
 
@@ -63,7 +66,13 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
         }
         None => {
             // create index
-            let index = Index::new(&index_name, data_dim, m, ef_construction);
+            let index = Index::new(
+                &index_name,
+                Box::new(hnsw::metrics::euclidean),
+                data_dim,
+                m,
+                ef_construction,
+            );
             ctx.log_debug(format!("{:?}", index).as_str());
             key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, (&index).into())?;
             // Add index to global hashmap
@@ -125,7 +134,7 @@ fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     Ok(1_usize.into())
 }
 
-fn load_index(ctx: &Context, index_name: &str) -> Result<Arc<RwLock<Index>>, RedisError> {
+fn load_index(ctx: &Context, index_name: &str) -> Result<IndexArc, RedisError> {
     // check if index is in global hashmap
     let mut indices = INDICES.write().unwrap();
     let index = match indices.get(index_name) {
@@ -141,7 +150,7 @@ fn load_index(ctx: &Context, index_name: &str) -> Result<Arc<RwLock<Index>>, Red
                 None => return Err(format!("Index: {} does not exist", index_name).into()),
             };
             let index = make_index(ctx, index_redis)?;
-            let index = Arc::new(RwLock::new(index.clone()));
+            let index = Arc::new(RwLock::new(index));
             indices.insert(index_name.to_owned(), index.clone());
             index
         }
@@ -150,8 +159,8 @@ fn load_index(ctx: &Context, index_name: &str) -> Result<Arc<RwLock<Index>>, Red
     Ok(index)
 }
 
-fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<Index, RedisError> {
-    let mut index: Index = ir.into();
+fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<Index<f32, f32>, RedisError> {
+    let mut index: Index<f32, f32> = ir.into();
 
     index.nodes = HashMap::with_capacity(ir.node_count);
     for node_name in &ir.nodes {
@@ -216,7 +225,11 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<Index, RedisError> {
     Ok(index)
 }
 
-fn update_index(ctx: &Context, index_name: &str, index: &Index) -> Result<(), RedisError> {
+fn update_index(
+    ctx: &Context,
+    index_name: &str,
+    index: &Index<f32, f32>,
+) -> Result<(), RedisError> {
     let key = ctx.open_key_writable(index_name);
     match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(_) => {

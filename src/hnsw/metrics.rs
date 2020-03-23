@@ -9,7 +9,7 @@ pub enum MetricFuncs {
     Euclidean,
 }
 
-pub type MetricFuncT<T> = fn(&[T], &[T], usize) -> f32;
+pub type MetricFuncT<T, R> = fn(&[T], &[T], usize) -> R;
 
 pub fn euclidean(v1: &[f32], v2: &[f32], n: usize) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

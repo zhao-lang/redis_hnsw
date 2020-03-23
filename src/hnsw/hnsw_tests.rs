@@ -1,8 +1,10 @@
 use crate::hnsw::hnsw::*;
+use crate::hnsw::metrics::euclidean;
 
 #[test]
 fn hnsw_test() {
-    let mut index = Index::new("foo", 4, 5, 16);
+    // index creation
+    let mut index: Index<f32, f32> = Index::new("foo", Box::new(euclidean), 4, 5, 16);
     assert_eq!(&index.name, "foo");
     assert_eq!(index.data_dim, 4);
     assert_eq!(index.m, 5);
@@ -12,6 +14,8 @@ fn hnsw_test() {
     assert_eq!(index.enterpoint, None);
 
     let mock_fn = |_s: String, _n: Node<f32>| {};
+
+    // add node
     for i in 0..100 {
         let name = format!("node{}", i);
         let data = vec![i as f32; 4];
@@ -20,6 +24,7 @@ fn hnsw_test() {
     assert_eq!(index.node_count, 100);
     assert_ne!(index.enterpoint, None);
 
+    // search
     let query = vec![10.0; 4];
     let res = index.search_knn(&query, 5).unwrap();
     assert_eq!(res.len(), 5);
@@ -29,4 +34,20 @@ fn hnsw_test() {
     assert_eq!(res[2].sim.into_inner(), -4.0);
     assert_eq!(res[3].sim.into_inner(), -16.0);
     assert_eq!(res[4].sim.into_inner(), -16.0);
+
+    // delete node
+    let node = index.nodes.get("node10").unwrap().clone();
+    index.delete_node("node10", mock_fn).unwrap();
+    assert_eq!(index.node_count, 99);
+    assert_eq!(index.nodes.get("node10").is_none(), true);
+    for l in &index.layers {
+        assert_eq!(l.contains(&node), false);
+    }
+    for n in index.nodes.values() {
+        for l in &n.read().neighbors {
+            for nn in l {
+                assert_ne!(*nn, node);
+            }
+        }
+    }
 }

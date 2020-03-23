@@ -1,6 +1,7 @@
 use super::metrics;
 use crate::types;
 
+use num::Float;
 use ordered_float::OrderedFloat;
 use owning_ref::{RefMutRefMut, RefRef, RwLockReadGuardRef, RwLockWriteGuardRefMut};
 use rand::prelude::*;
@@ -8,11 +9,11 @@ use std::cell::RefCell;
 use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::convert::From;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::{clone, fmt};
 
 #[derive(Debug)]
 pub enum HNSWError {
@@ -38,14 +39,14 @@ impl HNSWError {
     }
 }
 
-pub struct SearchResult<T> {
-    pub sim: OrderedFloat<f32>,
+pub struct SearchResult<T: Float, R: Float> {
+    pub sim: OrderedFloat<R>,
     pub name: String,
     pub data: Vec<T>,
 }
 
-impl<T: std::clone::Clone> SearchResult<T> {
-    fn new(sim: OrderedFloat<f32>, name: &str, data: &[T]) -> Self {
+impl<T: Float, R: Float> SearchResult<T, R> {
+    fn new(sim: OrderedFloat<R>, name: &str, data: &[T]) -> Self {
         SearchResult {
             sim: sim,
             name: name.to_owned(),
@@ -54,11 +55,15 @@ impl<T: std::clone::Clone> SearchResult<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for SearchResult<T> {
+impl<T, R> fmt::Debug for SearchResult<T, R>
+where
+    T: Float + fmt::Debug,
+    R: Float + fmt::Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "sim: {}, \
+            "sim: {:?}, \
              name: {:?}, \
              data: {:?}{}",
             self.sim,
@@ -81,16 +86,16 @@ impl<T: fmt::Debug> fmt::Debug for SearchResult<T> {
 type NodeRef<T> = Arc<RwLock<_Node<T>>>;
 
 #[derive(Clone)]
-pub struct _Node<T>
-where
-    T: std::clone::Clone,
-{
+pub struct _Node<T: Float> {
     pub name: String,
     pub data: Vec<T>,
     pub neighbors: Vec<Vec<Node<T>>>,
 }
 
-impl<T: fmt::Debug + std::clone::Clone> fmt::Debug for _Node<T> {
+impl<T> fmt::Debug for _Node<T>
+where
+    T: Float + fmt::Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -111,7 +116,7 @@ impl<T: fmt::Debug + std::clone::Clone> fmt::Debug for _Node<T> {
     }
 }
 
-impl<T: std::clone::Clone> _Node<T> {
+impl<T: Float> _Node<T> {
     fn push_levels(&mut self, level: usize, capacity: Option<usize>) {
         let neighbors = &mut self.neighbors;
         while neighbors.len() < level + 1 {
@@ -147,25 +152,23 @@ impl<T: std::clone::Clone> _Node<T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Node<T>(NodeRef<T>)
-where
-    T: std::clone::Clone;
+pub struct Node<T: Float>(NodeRef<T>);
 
-impl<T: std::clone::Clone> PartialEq for Node<T> {
+impl<T: Float> PartialEq for Node<T> {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl<T: std::clone::Clone> Eq for Node<T> {}
+impl<T: Float> Eq for Node<T> {}
 
-impl<T: std::clone::Clone> Hash for Node<T> {
+impl<T: Float> Hash for Node<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.read().name.hash(state);
     }
 }
 
-impl<T: std::clone::Clone> Node<T> {
+impl<T: Float> Node<T> {
     pub fn new(name: &str, data: &[T], capacity: usize) -> Self {
         let node = _Node {
             name: name.to_owned(),
@@ -204,24 +207,30 @@ impl<T: std::clone::Clone> Node<T> {
     // }
 }
 
-type SimPairRef<T> = Rc<RefCell<_SimPair<T>>>;
+type SimPairRef<T, R> = Rc<RefCell<_SimPair<T, R>>>;
 
 #[derive(Debug, Clone)]
-struct _SimPair<T>
+struct _SimPair<T, R>
 where
-    T: std::clone::Clone,
+    T: Float,
+    R: Float,
 {
-    pub sim: OrderedFloat<f32>,
+    pub sim: OrderedFloat<R>,
     pub node: Node<T>,
 }
 
 #[derive(Debug, Clone)]
-struct SimPair<T>(SimPairRef<T>)
+struct SimPair<T, R>(SimPairRef<T, R>)
 where
-    T: std::clone::Clone;
+    T: Float,
+    R: Float;
 
-impl<T: std::clone::Clone> SimPair<T> {
-    fn new(sim: OrderedFloat<f32>, node: Node<T>) -> Self {
+impl<T, R> SimPair<T, R>
+where
+    T: Float,
+    R: Float,
+{
+    fn new(sim: OrderedFloat<R>, node: Node<T>) -> Self {
         let sp = _SimPair {
             sim: sim,
             node: node,
@@ -229,58 +238,76 @@ impl<T: std::clone::Clone> SimPair<T> {
         SimPair(Rc::new(RefCell::new(sp)))
     }
 
-    fn read(&self) -> RefRef<_SimPair<T>> {
+    fn read(&self) -> RefRef<_SimPair<T, R>> {
         RefRef::new(self.0.borrow())
     }
 
-    fn write(&mut self) -> RefMutRefMut<_SimPair<T>> {
+    fn write(&mut self) -> RefMutRefMut<_SimPair<T, R>> {
         RefMutRefMut::new(self.0.borrow_mut())
     }
 }
 
-impl<T: std::clone::Clone> PartialEq for SimPair<T> {
+impl<T, R> PartialEq for SimPair<T, R>
+where
+    T: Float,
+    R: Float,
+{
     fn eq(&self, other: &Self) -> bool {
         self.0.borrow().sim == other.0.borrow().sim
     }
 }
 
-impl<T: std::clone::Clone> Eq for SimPair<T> {}
+impl<T: Float, R: Float> Eq for SimPair<T, R> {}
 
-impl<T: std::clone::Clone> PartialOrd for SimPair<T> {
+impl<T, R> PartialOrd for SimPair<T, R>
+where
+    T: Float,
+    R: Float,
+{
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.0.borrow().sim.partial_cmp(&other.0.borrow().sim)
     }
 }
 
-impl<T: std::clone::Clone> Ord for SimPair<T> {
+impl<T, R> Ord for SimPair<T, R>
+where
+    T: Float,
+    R: Float,
+{
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.borrow().sim.cmp(&other.0.borrow().sim)
     }
 }
 
-pub struct Index {
-    pub name: String,                          // index name
-    pub mfunc: Box<metrics::MetricFuncT<f32>>, // metric function
-    pub mfunc_kind: metrics::MetricFuncs,      // kind of the metric function
-    pub data_dim: usize,                       // dimensionality of the data
-    pub m: usize,                              // out vertexs per node
-    pub m_max: usize,                          // max number of vertexes per node
-    pub m_max_0: usize,                        // max number of vertexes at layer 0
-    pub ef_construction: usize,                // size of dynamic candidate list
-    pub level_mult: f64,                       // level generation factor
-    pub node_count: usize,                     // count of nodes
-    pub max_layer: usize,                      // idx of top layer
-    pub layers: Vec<HashSet<Node<f32>>>,       // distinct nodes in each layer
-    pub nodes: HashMap<String, Node<f32>>,     // hashmap of nodes
-    pub enterpoint: Option<Node<f32>>,         // enterpoint node
-    rng_: StdRng,                              // rng for level generation
+pub struct Index<T: Float, R: Float> {
+    pub name: String,                           // index name
+    pub mfunc: Box<metrics::MetricFuncT<T, R>>, // metric function
+    pub mfunc_kind: metrics::MetricFuncs,       // kind of the metric function
+    pub data_dim: usize,                        // dimensionality of the data
+    pub m: usize,                               // out vertexs per node
+    pub m_max: usize,                           // max number of vertexes per node
+    pub m_max_0: usize,                         // max number of vertexes at layer 0
+    pub ef_construction: usize,                 // size of dynamic candidate list
+    pub level_mult: f64,                        // level generation factor
+    pub node_count: usize,                      // count of nodes
+    pub max_layer: usize,                       // idx of top layer
+    pub layers: Vec<HashSet<Node<T>>>,          // distinct nodes in each layer
+    pub nodes: HashMap<String, Node<T>>,        // hashmap of nodes
+    pub enterpoint: Option<Node<T>>,            // enterpoint node
+    rng_: StdRng,                               // rng for level generation
 }
 
-impl Index {
-    pub fn new(name: &str, data_dim: usize, m: usize, ef_construction: usize) -> Self {
+impl<T: Float, R: Float> Index<T, R> {
+    pub fn new(
+        name: &str,
+        mfunc: Box<metrics::MetricFuncT<T, R>>,
+        data_dim: usize,
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
         Index {
             name: name.to_string(),
-            mfunc: Box::new(metrics::euclidean),
+            mfunc: mfunc,
             mfunc_kind: metrics::MetricFuncs::Euclidean,
             data_dim: data_dim,
             m: m,
@@ -298,7 +325,7 @@ impl Index {
     }
 }
 
-impl fmt::Debug for Index {
+impl<T: Float, R: Float> fmt::Debug for Index<T, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -327,29 +354,7 @@ impl fmt::Debug for Index {
     }
 }
 
-impl clone::Clone for Index {
-    fn clone(&self) -> Self {
-        Index {
-            name: self.name.clone(),
-            mfunc: self.mfunc.clone(),
-            mfunc_kind: self.mfunc_kind,
-            data_dim: self.data_dim,
-            m: self.m,
-            m_max: self.m_max,
-            m_max_0: self.m_max_0,
-            ef_construction: self.ef_construction,
-            level_mult: self.level_mult,
-            node_count: self.node_count,
-            max_layer: self.max_layer,
-            layers: self.layers.clone(),
-            nodes: self.nodes.clone(),
-            enterpoint: self.enterpoint.clone(),
-            rng_: self.rng_.clone(),
-        }
-    }
-}
-
-impl From<&types::IndexRedis> for Index {
+impl From<&types::IndexRedis> for Index<f32, f32> {
     fn from(index: &types::IndexRedis) -> Self {
         Index {
             name: index.name.clone(),
@@ -378,12 +383,16 @@ impl From<&types::IndexRedis> for Index {
     }
 }
 
-impl Index {
+impl<T, R> Index<T, R>
+where
+    T: Float + Send + Sync + 'static,
+    R: Float,
+{
     pub fn add_node(
         &mut self,
         name: &str,
-        data: &[f32],
-        update_fn: fn(String, Node<f32>),
+        data: &[T],
+        update_fn: fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         if data.len() != self.data_dim {
             return Err(format!("data dimension: {} does not match Index", data.len()).into());
@@ -413,7 +422,7 @@ impl Index {
     pub fn delete_node(
         &mut self,
         name: &str,
-        update_fn: fn(String, Node<f32>),
+        update_fn: fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         let node = match self.nodes.remove(name) {
             Some(node) => node,
@@ -473,7 +482,7 @@ impl Index {
         Ok(())
     }
 
-    pub fn search_knn(&self, data: &[f32], k: usize) -> Result<Vec<SearchResult<f32>>, HNSWError> {
+    pub fn search_knn(&self, data: &[T], k: usize) -> Result<Vec<SearchResult<T, R>>, HNSWError> {
         if data.len() != self.data_dim {
             return Err(format!("data dimension: {} does not match Index", data.len()).into());
         }
@@ -488,8 +497,8 @@ impl Index {
     fn insert(
         &mut self,
         name: &str,
-        data: &[f32],
-        update_fn: fn(String, Node<f32>),
+        data: &[T],
+        update_fn: fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         let l = self.gen_random_level();
         let l_max = self.max_layer;
@@ -505,7 +514,7 @@ impl Index {
 
         let query = self.nodes.get(name).unwrap();
         let mut ep = self.enterpoint.as_ref().unwrap().clone();
-        let mut w: BinaryHeap<SimPair<f32>>;
+        let mut w: BinaryHeap<SimPair<T, R>>;
 
         let mut lc = l_max;
         while lc > l {
@@ -534,7 +543,7 @@ impl Index {
                 let epair = neighbors.pop().unwrap();
                 let er = epair.read();
 
-                let mut econn: BinaryHeap<SimPair<f32>>;
+                let mut econn: BinaryHeap<SimPair<T, R>>;
                 {
                     let enr = er.node.read();
                     let eneighbors = &enr.neighbors[lc];
@@ -594,17 +603,17 @@ impl Index {
 
     fn search_level(
         &self,
-        query: &[f32],
-        ep: Node<f32>,
+        query: &[T],
+        ep: Node<T>,
         ef: usize,
         level: usize,
-    ) -> BinaryHeap<SimPair<f32>> {
+    ) -> BinaryHeap<SimPair<T, R>> {
         let mut v = HashSet::with_capacity(ef);
 
         {
             v.insert(ep.clone());
         }
-        let qsim: OrderedFloat<f32>;
+        let qsim: OrderedFloat<R>;
         {
             qsim = OrderedFloat::from((self.mfunc)(query, &ep.read().data, self.data_dim));
         }
@@ -663,15 +672,15 @@ impl Index {
 
     fn select_neighbors(
         &self,
-        query: &Node<f32>,
-        c: &BinaryHeap<SimPair<f32>>,
+        query: &Node<T>,
+        c: &BinaryHeap<SimPair<T, R>>,
         m: usize,
         lc: usize,
         extend_candidates: bool,
         keep_pruned_connections: bool,
-        ignored_node: Option<&Node<f32>>,
-    ) -> BinaryHeap<SimPair<f32>> {
-        let mut r: BinaryHeap<SimPair<f32>> = BinaryHeap::with_capacity(m);
+        ignored_node: Option<&Node<T>>,
+    ) -> BinaryHeap<SimPair<T, R>> {
+        let mut r: BinaryHeap<SimPair<T, R>> = BinaryHeap::with_capacity(m);
         let mut w = c.clone();
         let mut wd = BinaryHeap::new();
 
@@ -747,8 +756,8 @@ impl Index {
 
     fn connect_neighbors(
         &self,
-        query: &Node<f32>,
-        neighbors: &BinaryHeap<SimPair<f32>>,
+        query: &Node<T>,
+        neighbors: &BinaryHeap<SimPair<T, R>>,
         level: usize,
     ) {
         let mut neighbors = neighbors.clone();
@@ -764,12 +773,12 @@ impl Index {
 
     fn update_node_connections(
         &self,
-        node: &Node<f32>,
-        new_neighbors: &BinaryHeap<SimPair<f32>>,
-        old_neighbors: &BinaryHeap<SimPair<f32>>,
+        node: &Node<T>,
+        new_neighbors: &BinaryHeap<SimPair<T, R>>,
+        old_neighbors: &BinaryHeap<SimPair<T, R>>,
         level: usize,
-        ignored_node: Option<&Node<f32>>,
-    ) -> HashSet<Node<f32>> {
+        ignored_node: Option<&Node<T>>,
+    ) -> HashSet<Node<T>> {
         let mut newconn = new_neighbors.clone();
         let mut rmconn = old_neighbors.clone().into_vec();
         let mut updated = HashSet::new();
@@ -813,14 +822,14 @@ impl Index {
         updated
     }
 
-    fn delete_node_from_neighbors(&self, node: &Node<f32>, lc: usize) -> HashSet<Node<f32>> {
+    fn delete_node_from_neighbors(&self, node: &Node<T>, lc: usize) -> HashSet<Node<T>> {
         let r = node.read();
         let neighbors = &r.neighbors[lc];
         let mut updated = HashSet::new();
 
         for n in neighbors {
-            let nnewconn: BinaryHeap<SimPair<f32>>;
-            let mut nconn: BinaryHeap<SimPair<f32>>;
+            let nnewconn: BinaryHeap<SimPair<T, R>>;
+            let mut nconn: BinaryHeap<SimPair<T, R>>;
             {
                 let nr = n.read();
                 let nneighbors = &nr.neighbors[lc];
@@ -846,7 +855,7 @@ impl Index {
         updated
     }
 
-    fn search_knn_internal(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult<f32>> {
+    fn search_knn_internal(&self, query: &[T], k: usize, ef: usize) -> Vec<SearchResult<T, R>> {
         let mut ep = self.enterpoint.as_ref().unwrap().clone();
         let l_max = self.max_layer;
 
