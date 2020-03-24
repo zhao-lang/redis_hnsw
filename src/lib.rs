@@ -191,7 +191,7 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<Index<f32, f32>, RedisEr
                     Some(node) => node,
                     None => return Err(format!("Node: {} does not exist", node_name).into()),
                 };
-                node_layer.push(nn.clone());
+                node_layer.push(nn.downgrade());
             }
             target.write().neighbors.push(node_layer);
         }
@@ -205,7 +205,7 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<Index<f32, f32>, RedisEr
                 Some(n) => n,
                 None => return Err(format!("Node: {} does not exist", node_name).into()),
             };
-            node_layer.insert(node.clone());
+            node_layer.insert(node.downgrade());
         }
         index.layers.push(node_layer);
     }
@@ -217,7 +217,7 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<Index<f32, f32>, RedisEr
                 Some(n) => n,
                 None => return Err(format!("Node: {} does not exist", node_name).into()),
             };
-            Some(node.clone())
+            Some(node.downgrade())
         }
         None => None,
     };
@@ -292,6 +292,7 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     let node_name = format!("{}.{}.{}", PREFIX, &args[1], &args[2]);
 
+    // TODO return error if node has more than 1 strong_count
     match index.delete_node(&node_name, update_node) {
         Err(e) => return Err(e.error_string().into()),
         _ => (),

@@ -1,6 +1,7 @@
 use crate::hnsw::hnsw::*;
 use crate::hnsw::metrics::euclidean;
 use std::sync::Arc;
+use std::{thread, time};
 
 #[test]
 fn hnsw_test() {
@@ -14,13 +15,28 @@ fn hnsw_test() {
     assert_eq!(index.max_layer, 0);
     assert_eq!(index.enterpoint, None);
 
-    let mock_fn = |_s: String, _n: Node<f32>| {};
+    let mock_fn = |_s: String, _n: Node<f32>| {
+        let ten_millis = time::Duration::from_millis(10);
+        thread::sleep(ten_millis);
+    };
 
     // add node
     for i in 0..100 {
         let name = format!("node{}", i);
         let data = vec![i as f32; 4];
         index.add_node(&name, &data, mock_fn).unwrap();
+    }
+    // sleep for a brief period to make sure all threads are done
+    let hundred_millis = time::Duration::from_millis(100);
+    thread::sleep(hundred_millis);
+    for i in 0..100 {
+        let node_name = format!("node{}", i);
+        let node = index.nodes.get(&node_name).unwrap();
+        let sc = Arc::strong_count(&node.0);
+        if sc > 1 {
+            println!("{:?}", node);
+        }
+        assert_eq!(sc, 1);
     }
     assert_eq!(index.node_count, 100);
     assert_ne!(index.enterpoint, None);
@@ -44,15 +60,22 @@ fn hnsw_test() {
         assert_eq!(index.node_count, 100 - i - 1);
         assert_eq!(index.nodes.get(&node_name).is_none(), true);
         for l in &index.layers {
-            assert_eq!(l.contains(&node), false);
+            assert_eq!(l.contains(&node.downgrade()), false);
         }
         for n in index.nodes.values() {
             for l in &n.read().neighbors {
                 for nn in l {
-                    assert_ne!(*nn, node);
+                    assert_ne!(nn.upgrade(), node);
                 }
             }
         }
-        assert_eq!(Arc::strong_count(&node.0), 1);
+        // sleep for a brief period to make sure all threads are done
+        let hundred_millis = time::Duration::from_millis(10);
+        thread::sleep(hundred_millis);
+        let sc = Arc::strong_count(&node.0);
+        if sc > 1 {
+            println!("Delete {:?}", node);
+        }
+        assert_eq!(sc, 1);
     }
 }
