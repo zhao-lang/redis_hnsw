@@ -135,11 +135,11 @@ impl<T: Float> _Node<T> {
         }
     }
 
-    fn rm_neighbor(&mut self, level: usize, neighbor: Node<T>) {
+    fn rm_neighbor(&mut self, level: usize, neighbor: &Node<T>) {
         let neighbors = &mut self.neighbors;
         let index = neighbors[level]
             .iter()
-            .position(|n| *n == neighbor)
+            .position(|n| *n == *neighbor)
             .unwrap();
         neighbors[level].remove(index);
     }
@@ -152,7 +152,7 @@ impl<T: Float> _Node<T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Node<T: Float>(NodeRef<T>);
+pub struct Node<T: Float>(pub NodeRef<T>);
 
 impl<T: Float> PartialEq for Node<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -196,7 +196,7 @@ impl<T: Float> Node<T> {
         node.add_neighbor(level, neighbor, capacity);
     }
 
-    fn rm_neighbor(&self, level: usize, neighbor: Node<T>) {
+    fn rm_neighbor(&self, level: usize, neighbor: &Node<T>) {
         let node = &mut self.0.try_write().unwrap();
         node.rm_neighbor(level, neighbor);
     }
@@ -518,7 +518,7 @@ where
 
         let mut lc = l_max;
         while lc > l {
-            w = self.search_level(data, ep.clone(), 1, lc);
+            w = self.search_level(data, &ep, 1, lc);
             ep = w.pop().unwrap().read().node.clone();
 
             if lc == 0 {
@@ -529,7 +529,7 @@ where
 
         let mut updated = HashSet::new();
         for lc in (0..(min(l_max, l) + 1)).rev() {
-            w = self.search_level(data, ep.clone(), self.ef_construction, lc);
+            w = self.search_level(data, &ep, self.ef_construction, lc);
             let mut neighbors = self.select_neighbors(query, &w, self.m, lc, true, true, None);
             self.connect_neighbors(query, &neighbors, lc);
 
@@ -604,7 +604,7 @@ where
     fn search_level(
         &self,
         query: &[T],
-        ep: Node<T>,
+        ep: &Node<T>,
         ef: usize,
         level: usize,
     ) -> BinaryHeap<SimPair<T, R>> {
@@ -622,7 +622,7 @@ where
         let mut c = BinaryHeap::with_capacity(ef);
         let mut w = BinaryHeap::with_capacity(ef);
         c.push(qpair.clone());
-        w.push(Reverse(qpair.clone()));
+        w.push(Reverse(qpair));
 
         while !c.is_empty() {
             let mut cpair = c.pop().unwrap();
@@ -653,7 +653,7 @@ where
                     if esim > fpair.0.read().sim || w.len() < ef {
                         let epair = SimPair::new(esim, neighbor.clone());
                         c.push(epair.clone());
-                        w.push(Reverse(epair.clone()));
+                        w.push(Reverse(epair));
 
                         if w.len() > ef {
                             w.pop();
@@ -806,14 +806,14 @@ where
         while !rmconn.is_empty() {
             let rmpair = rmconn.pop().unwrap();
             let rmpr = rmpair.read();
-            node.rm_neighbor(level, rmpr.node.clone());
+            node.rm_neighbor(level, &rmpr.node);
             // if node to be removed is the ignored node then pass
             match ignored_node {
                 Some(n) if rmpr.node == *n => {
                     continue;
                 }
                 _ => {
-                    rmpr.node.rm_neighbor(level, node.clone());
+                    rmpr.node.rm_neighbor(level, &node);
                     updated.insert(rmpr.node.clone());
                 }
             }
@@ -861,12 +861,12 @@ where
 
         let mut lc = l_max;
         while lc > 0 {
-            let w = self.search_level(query, ep, 1, lc);
+            let w = self.search_level(query, &ep, 1, lc);
             ep = w.peek().unwrap().read().node.clone();
             lc -= 1;
         }
 
-        let mut w = self.search_level(query, ep, ef, 0);
+        let mut w = self.search_level(query, &ep, ef, 0);
 
         let mut res = Vec::with_capacity(k);
         while res.len() < k && !w.is_empty() {

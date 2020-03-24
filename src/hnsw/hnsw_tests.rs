@@ -1,5 +1,6 @@
 use crate::hnsw::hnsw::*;
 use crate::hnsw::metrics::euclidean;
+use std::sync::Arc;
 
 #[test]
 fn hnsw_test() {
@@ -36,18 +37,22 @@ fn hnsw_test() {
     assert_eq!(res[4].sim.into_inner(), -16.0);
 
     // delete node
-    let node = index.nodes.get("node10").unwrap().clone();
-    index.delete_node("node10", mock_fn).unwrap();
-    assert_eq!(index.node_count, 99);
-    assert_eq!(index.nodes.get("node10").is_none(), true);
-    for l in &index.layers {
-        assert_eq!(l.contains(&node), false);
-    }
-    for n in index.nodes.values() {
-        for l in &n.read().neighbors {
-            for nn in l {
-                assert_ne!(*nn, node);
+    for i in 0..100 {
+        let node_name = format!("node{}", i);
+        let node = index.nodes.get(&node_name).unwrap().clone();
+        index.delete_node(&node_name, mock_fn).unwrap();
+        assert_eq!(index.node_count, 100 - i - 1);
+        assert_eq!(index.nodes.get(&node_name).is_none(), true);
+        for l in &index.layers {
+            assert_eq!(l.contains(&node), false);
+        }
+        for n in index.nodes.values() {
+            for l in &n.read().neighbors {
+                for nn in l {
+                    assert_ne!(*nn, node);
+                }
             }
         }
+        assert_eq!(Arc::strong_count(&node.0), 1);
     }
 }
