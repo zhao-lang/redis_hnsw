@@ -15,10 +15,7 @@ fn hnsw_test() {
     assert_eq!(index.max_layer, 0);
     assert_eq!(index.enterpoint, None);
 
-    let mock_fn = |_s: String, _n: Node<f32>| {
-        let ten_millis = time::Duration::from_millis(10);
-        thread::sleep(ten_millis);
-    };
+    let mock_fn = |_s: String, _n: Node<f32>| {};
 
     // add node
     for i in 0..100 {
@@ -27,8 +24,8 @@ fn hnsw_test() {
         index.add_node(&name, &data, mock_fn).unwrap();
     }
     // sleep for a brief period to make sure all threads are done
-    let hundred_millis = time::Duration::from_millis(100);
-    thread::sleep(hundred_millis);
+    let ten_millis = time::Duration::from_millis(10);
+    thread::sleep(ten_millis);
     for i in 0..100 {
         let node_name = format!("node{}", i);
         let node = index.nodes.get(&node_name).unwrap();
@@ -70,8 +67,8 @@ fn hnsw_test() {
             }
         }
         // sleep for a brief period to make sure all threads are done
-        let hundred_millis = time::Duration::from_millis(10);
-        thread::sleep(hundred_millis);
+        let ten_millis = time::Duration::from_millis(10);
+        thread::sleep(ten_millis);
         let sc = Arc::strong_count(&node.0);
         if sc > 1 {
             println!("Delete {:?}", node);

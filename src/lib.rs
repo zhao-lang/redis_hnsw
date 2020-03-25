@@ -293,6 +293,14 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let node_name = format!("{}.{}.{}", PREFIX, &args[1], &args[2]);
 
     // TODO return error if node has more than 1 strong_count
+    let node = index.nodes.get(&node_name).unwrap();
+    if Arc::strong_count(&node.0) > 1 {
+        return Err(format!(
+            "{} is being accessed, unable to delete. Try again later",
+            &node_name
+        )
+        .into());
+    }
     match index.delete_node(&node_name, update_node) {
         Err(e) => return Err(e.error_string().into()),
         _ => (),
