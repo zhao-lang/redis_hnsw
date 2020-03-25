@@ -44,7 +44,7 @@ impl From<&Index<f32, f32>> for IndexRedis {
                 .iter()
                 .map(|l| {
                     l.into_iter()
-                        .map(|n| n.read().name.clone())
+                        .map(|n| n.upgrade().read().name.clone())
                         .collect::<Vec<String>>()
                 })
                 .collect(),
@@ -54,7 +54,7 @@ impl From<&Index<f32, f32>> for IndexRedis {
                 .map(|k| k.clone())
                 .collect::<Vec<String>>(),
             enterpoint: match &index.enterpoint {
-                Some(ep) => Some(ep.read().name.clone()),
+                Some(ep) => Some(ep.upgrade().read().name.clone()),
                 None => None,
             },
         }
@@ -271,7 +271,7 @@ impl From<&Node<f32>> for NodeRedis {
                 .into_iter()
                 .map(|l| {
                     l.into_iter()
-                        .map(|n| n.read().name.clone())
+                        .map(|n| n.upgrade().read().name.clone())
                         .collect::<Vec<String>>()
                 })
                 .collect(),
