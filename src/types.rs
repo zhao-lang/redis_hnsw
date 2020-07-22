@@ -26,8 +26,8 @@ pub struct IndexRedis {
     pub enterpoint: Option<String>, // string key to the enterpoint node
 }
 
-impl From<&Index<f32, f32>> for IndexRedis {
-    fn from(index: &Index<f32, f32>) -> Self {
+impl From<& mut Index<f32, f32>> for IndexRedis {
+    fn from(index: & mut Index<f32, f32>) -> Self {
         IndexRedis {
             name: index.name.clone(),
             mfunc_kind: format!("{:?}", index.mfunc_kind),
