@@ -1,4 +1,4 @@
-use crate::hnsw::hnsw::*;
+use crate::hnsw::core::*;
 use crate::hnsw::metrics::euclidean;
 use std::sync::Arc;
 use std::{thread, time};
