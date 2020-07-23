@@ -1,5 +1,4 @@
 use super::metrics;
-use crate::types;
 
 use num::Float;
 use ordered_float::OrderedFloat;
@@ -13,7 +12,14 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock, Weak};
-use std::thread;
+// use std::thread;
+
+struct SelectParams {
+    m: usize,
+    lc: usize,
+    extend_candidates: bool,
+    keep_pruned_connections: bool,
+}
 
 #[derive(Debug)]
 pub enum HNSWError {
@@ -48,7 +54,7 @@ pub struct SearchResult<T: Float, R: Float> {
 impl<T: Float, R: Float> SearchResult<T, R> {
     fn new(sim: OrderedFloat<R>, name: &str, data: &[T]) -> Self {
         SearchResult {
-            sim: sim,
+            sim,
             name: name.to_owned(),
             data: data.to_vec(),
         }
@@ -108,7 +114,7 @@ where
             self.neighbors
                 .iter()
                 .map(|l| {
-                    l.into_iter()
+                    l.iter()
                         .map(|n| n.upgrade().read().name.to_owned())
                         .collect::<Vec<String>>()
                 })
@@ -249,8 +255,8 @@ where
 {
     fn new(sim: OrderedFloat<R>, node: Node<T>) -> Self {
         let sp = _SimPair {
-            sim: sim,
-            node: node,
+            sim,
+            node,
         };
         SimPair(Rc::new(RefCell::new(sp)))
     }
@@ -311,7 +317,7 @@ pub struct Index<T: Float, R: Float> {
     pub layers: Vec<HashSet<NodeWeak<T>>>,      // distinct nodes in each layer
     pub nodes: HashMap<String, Node<T>>,        // hashmap of nodes
     pub enterpoint: Option<NodeWeak<T>>,        // enterpoint node
-    rng_: StdRng,                               // rng for level generation
+    pub rng_: StdRng,                           // rng for level generation
 }
 
 impl<T: Float, R: Float> Index<T, R> {
@@ -324,13 +330,13 @@ impl<T: Float, R: Float> Index<T, R> {
     ) -> Self {
         Index {
             name: name.to_string(),
-            mfunc: mfunc,
+            mfunc,
             mfunc_kind: metrics::MetricFuncs::Euclidean,
-            data_dim: data_dim,
-            m: m,
+            data_dim,
+            m,
             m_max: m,
             m_max_0: m * 2,
-            ef_construction: ef_construction,
+            ef_construction,
             level_mult: 1.0 / (1.0 * m as f64).ln(),
             node_count: 0,
             max_layer: 0,
@@ -371,35 +377,6 @@ impl<T: Float, R: Float> fmt::Debug for Index<T, R> {
     }
 }
 
-impl From<&types::IndexRedis> for Index<f32, f32> {
-    fn from(index: &types::IndexRedis) -> Self {
-        Index {
-            name: index.name.clone(),
-            mfunc: match index.mfunc_kind.as_str() {
-                "Euclidean" => Box::new(metrics::euclidean),
-                _ => Box::new(metrics::euclidean),
-            },
-            mfunc_kind: match index.mfunc_kind.as_str() {
-                "Euclidean" => metrics::MetricFuncs::Euclidean,
-                _ => metrics::MetricFuncs::Euclidean,
-            },
-            data_dim: index.data_dim,
-            m: index.m,
-            m_max: index.m_max,
-            m_max_0: index.m_max_0,
-            ef_construction: index.ef_construction,
-            level_mult: index.level_mult,
-            node_count: index.node_count,
-            max_layer: index.max_layer,
-            // the next 3 need to be populated from redis
-            layers: Vec::new(),
-            nodes: HashMap::new(),
-            enterpoint: None,
-            rng_: StdRng::from_entropy(),
-        }
-    }
-}
-
 impl<T, R> Index<T, R>
 where
     T: Float + Send + Sync + 'static,
@@ -409,7 +386,7 @@ where
         &mut self,
         name: &str,
         data: &[T],
-        update_fn: fn(String, Node<T>),
+        update_fn: impl Fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         if data.len() != self.data_dim {
             return Err(format!("data dimension: {} does not match Index", data.len()).into());
@@ -429,7 +406,7 @@ where
             return Ok(());
         }
 
-        if !self.nodes.get(name).is_none() {
+        if self.nodes.get(name).is_some() {
             return Err(format!("Node: {:?} already exists", name).into());
         }
 
@@ -439,7 +416,7 @@ where
     pub fn delete_node(
         &mut self,
         name: &str,
-        update_fn: fn(String, Node<T>),
+        update_fn: impl Fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         let node = match self.nodes.remove(name) {
             Some(node) => node,
@@ -467,7 +444,7 @@ where
         for n in updated {
             let name = n.read().name.clone();
             let node = n.clone();
-            let _ = thread::spawn(move || update_fn(name, node));
+            update_fn(name, node);
         }
 
         // update enterpoint if necessary
@@ -515,7 +492,7 @@ where
         &mut self,
         name: &str,
         data: &[T],
-        update_fn: fn(String, Node<T>),
+        update_fn: impl Fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         let l = self.gen_random_level();
         let l_max = self.max_layer;
@@ -547,7 +524,13 @@ where
         let mut updated = HashSet::new();
         for lc in (0..(min(l_max, l) + 1)).rev() {
             w = self.search_level(data, &ep.upgrade(), self.ef_construction, lc);
-            let mut neighbors = self.select_neighbors(query, &w, self.m, lc, true, true, None);
+            let params = SelectParams{
+                m: self.m, 
+                lc,
+                extend_candidates: true, 
+                keep_pruned_connections: true
+            };
+            let mut neighbors = self.select_neighbors(query, &w, params, None);
             self.connect_neighbors(query, &neighbors, lc);
 
             // add node to list of nodes to be updated in redis
@@ -578,8 +561,14 @@ where
 
                 let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
                 if econn.len() > m_max {
+                    let params = SelectParams{
+                        m: m_max, 
+                        lc,
+                        extend_candidates: true, 
+                        keep_pruned_connections: true
+                    };
                     let enewconn =
-                        self.select_neighbors(&er.node, &econn, m_max, lc, true, true, None);
+                        self.select_neighbors(&er.node, &econn, params, None);
                     let up = self.update_node_connections(&er.node, &enewconn, &econn, lc, None);
                     for u in up {
                         updated.insert(u);
@@ -594,7 +583,7 @@ where
         for n in updated {
             let name = n.read().name.clone();
             let node = n.clone();
-            let _ = thread::spawn(move || update_fn(name, node));
+            update_fn(name, node);
         }
 
         // new enterpoint if we're in a higher layer
@@ -692,18 +681,15 @@ where
         &self,
         query: &Node<T>,
         c: &BinaryHeap<SimPair<T, R>>,
-        m: usize,
-        lc: usize,
-        extend_candidates: bool,
-        keep_pruned_connections: bool,
+        params: SelectParams,
         ignored_node: Option<&Node<T>>,
     ) -> BinaryHeap<SimPair<T, R>> {
-        let mut r: BinaryHeap<SimPair<T, R>> = BinaryHeap::with_capacity(m);
+        let mut r: BinaryHeap<SimPair<T, R>> = BinaryHeap::with_capacity(params.m);
         let mut w = c.clone();
         let mut wd = BinaryHeap::new();
 
         // extend candidates by their neighbors
-        if extend_candidates {
+        if params.extend_candidates {
             let mut ccopy = c.clone();
 
             let mut v = HashSet::with_capacity(ccopy.capacity());
@@ -716,7 +702,7 @@ where
             while !ccopy.is_empty() {
                 let epair = ccopy.pop().unwrap();
 
-                for eneighbor in &epair.read().node.read().neighbors[lc] {
+                for eneighbor in &epair.read().node.read().neighbors[params.lc] {
                     let eneighbor = eneighbor.upgrade();
                     if eneighbor == *query
                         || (ignored_node.is_some() && eneighbor == *ignored_node.unwrap())
@@ -738,7 +724,7 @@ where
             }
         }
 
-        while !w.is_empty() && r.len() < m {
+        while !w.is_empty() && r.len() < params.m {
             let epair = w.pop().unwrap();
             let enr = epair.read();
 
@@ -755,8 +741,8 @@ where
         }
 
         // add back some of the discarded connections
-        if keep_pruned_connections {
-            while !wd.is_empty() && r.len() < m {
+        if params.keep_pruned_connections {
+            while !wd.is_empty() && r.len() < params.m {
                 let ppair = wd.pop().unwrap();
                 {
                     let pr = ppair.read();
@@ -813,11 +799,8 @@ where
             updated.insert(npr.node.clone());
             // if new neighbor exists in the old set then we remove it from
             // the set of neighbors to be removed
-            match rmconn.iter().position(|n| n.read().node == npr.node) {
-                Some(index) => {
-                    rmconn.remove(index);
-                }
-                None => (),
+            if let Some(index) = rmconn.iter().position(|n| n.read().node == npr.node) {
+                rmconn.remove(index);
             }
         }
 
@@ -864,7 +847,13 @@ where
                 }
 
                 let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
-                nnewconn = self.select_neighbors(&n, &nconn, m_max, lc, true, true, Some(node));
+                let params = SelectParams{
+                    m: m_max, 
+                    lc,
+                    extend_candidates: true, 
+                    keep_pruned_connections: true
+                };
+                nnewconn = self.select_neighbors(&n, &nconn, params, Some(node));
             }
             updated.insert(n.clone());
             let up = self.update_node_connections(&n, &nnewconn, &nconn, lc, Some(node));
@@ -896,7 +885,7 @@ where
             let cnr = cr.node.read();
             res.push(SearchResult::new(
                 cr.sim,
-                &((&cnr.name).split(".").collect::<Vec<&str>>())
+                &((&cnr.name).split('.').collect::<Vec<&str>>())
                     .last()
                     .unwrap(),
                 &cnr.data,

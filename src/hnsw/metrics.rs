@@ -28,7 +28,7 @@ fn hsum_ps_sse3(v: __m128) -> f32 {
         let mut sums: __m128 = _mm_add_ps(v, shuf);
         shuf = _mm_movehl_ps(shuf, sums); // high half -> low half
         sums = _mm_add_ss(sums, shuf);
-        return _mm_cvtss_f32(sums);
+        _mm_cvtss_f32(sums)
     }
 }
 
@@ -37,7 +37,7 @@ fn hsum256_ps_avx(v: __m256) -> f32 {
         let mut vlow: __m128 = _mm256_castps256_ps128(v);
         let vhigh: __m128 = _mm256_extractf128_ps(v, 1); // high 128
         vlow = _mm_add_ps(vlow, vhigh); // add the low 128
-        return hsum_ps_sse3(vlow); // and inline the sse3 version, which is optimal for AVX
+        hsum_ps_sse3(vlow) // and inline the sse3 version, which is optimal for AVX
     }
 }
 
@@ -53,7 +53,7 @@ pub fn sim_func_avx_euc(a: &[f32], b: &[f32], n: usize) -> f32 {
         let mut euc4: __m256 = _mm256_setzero_ps();
 
         for i in (0..n).step_by(32) {
-            let v1: __m256 = _mm256_sub_ps(_mm256_loadu_ps(&a[i + 0]), _mm256_loadu_ps(&b[i + 0]));
+            let v1: __m256 = _mm256_sub_ps(_mm256_loadu_ps(&a[i]), _mm256_loadu_ps(&b[i]));
             euc1 = _mm256_fmadd_ps(v1, v1, euc1);
 
             let v2: __m256 = _mm256_sub_ps(_mm256_loadu_ps(&a[i + 8]), _mm256_loadu_ps(&b[i + 8]));

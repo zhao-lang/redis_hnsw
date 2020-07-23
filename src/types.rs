@@ -1,13 +1,45 @@
 use redis_module::native_types::RedisType;
 use redis_module::{raw, RedisString, RedisValue};
+
+use rand::prelude::*;
+use std::collections::HashMap;
 use std::convert::From;
 use std::os::raw::c_void;
 use std::{fmt, ptr};
 
-use super::hnsw::{Index, Node, SearchResult};
+use super::hnsw::{Index, Node, SearchResult, metrics};
 
 static INDEX_VERSION: i32 = 0;
 static NODE_VERSION: i32 = 0;
+
+impl From<&IndexRedis> for Index<f32, f32> {
+    fn from(index: &IndexRedis) -> Self {
+        Index {
+            name: index.name.clone(),
+            mfunc: match index.mfunc_kind.as_str() {
+                "Euclidean" => Box::new(metrics::euclidean),
+                _ => Box::new(metrics::euclidean),
+            },
+            mfunc_kind: match index.mfunc_kind.as_str() {
+                "Euclidean" => metrics::MetricFuncs::Euclidean,
+                _ => metrics::MetricFuncs::Euclidean,
+            },
+            data_dim: index.data_dim,
+            m: index.m,
+            m_max: index.m_max,
+            m_max_0: index.m_max_0,
+            ef_construction: index.ef_construction,
+            level_mult: index.level_mult,
+            node_count: index.node_count,
+            max_layer: index.max_layer,
+            // the next 3 need to be populated from redis
+            layers: Vec::new(),
+            nodes: HashMap::new(),
+            enterpoint: None,
+            rng_: StdRng::from_entropy(),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct IndexRedis {
@@ -26,8 +58,8 @@ pub struct IndexRedis {
     pub enterpoint: Option<String>, // string key to the enterpoint node
 }
 
-impl From<&Index<f32, f32>> for IndexRedis {
-    fn from(index: &Index<f32, f32>) -> Self {
+impl From<& mut Index<f32, f32>> for IndexRedis {
+    fn from(index: & mut Index<f32, f32>) -> Self {
         IndexRedis {
             name: index.name.clone(),
             mfunc_kind: format!("{:?}", index.mfunc_kind),
@@ -43,7 +75,7 @@ impl From<&Index<f32, f32>> for IndexRedis {
                 .layers
                 .iter()
                 .map(|l| {
-                    l.into_iter()
+                    l.iter()
                         .map(|n| n.upgrade().read().name.clone())
                         .collect::<Vec<String>>()
                 })
@@ -51,7 +83,7 @@ impl From<&Index<f32, f32>> for IndexRedis {
             nodes: index
                 .nodes
                 .keys()
-                .map(|k| k.clone())
+                .cloned()
                 .collect::<Vec<String>>(),
             enterpoint: match &index.enterpoint {
                 Some(ep) => Some(ep.upgrade().read().name.clone()),

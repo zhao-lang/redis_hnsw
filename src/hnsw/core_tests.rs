@@ -1,14 +1,17 @@
-use crate::hnsw::hnsw::*;
+use crate::hnsw::core::*;
 use crate::hnsw::metrics::euclidean;
 use std::sync::Arc;
 use std::{thread, time};
 
 #[test]
 fn hnsw_test() {
+    let n = 100;
+    let data_dim = 4;
+
     // index creation
-    let mut index: Index<f32, f32> = Index::new("foo", Box::new(euclidean), 4, 5, 16);
+    let mut index: Index<f32, f32> = Index::new("foo", Box::new(euclidean), data_dim, 5, 16);
     assert_eq!(&index.name, "foo");
-    assert_eq!(index.data_dim, 4);
+    assert_eq!(index.data_dim, data_dim);
     assert_eq!(index.m, 5);
     assert_eq!(index.ef_construction, 16);
     assert_eq!(index.node_count, 0);
@@ -18,15 +21,15 @@ fn hnsw_test() {
     let mock_fn = |_s: String, _n: Node<f32>| {};
 
     // add node
-    for i in 0..100 {
+    for i in 0..n {
         let name = format!("node{}", i);
-        let data = vec![i as f32; 4];
+        let data = vec![i as f32; data_dim];
         index.add_node(&name, &data, mock_fn).unwrap();
     }
-    // sleep for a brief period to make sure all threads are done
-    let ten_millis = time::Duration::from_millis(10);
-    thread::sleep(ten_millis);
-    for i in 0..100 {
+    // // sleep for a brief period to make sure all threads are done
+    // let ten_millis = time::Duration::from_millis(10);
+    // thread::sleep(ten_millis);
+    for i in 0..n {
         let node_name = format!("node{}", i);
         let node = index.nodes.get(&node_name).unwrap();
         let sc = Arc::strong_count(&node.0);
@@ -35,7 +38,7 @@ fn hnsw_test() {
         }
         assert_eq!(sc, 1);
     }
-    assert_eq!(index.node_count, 100);
+    assert_eq!(index.node_count, n);
     assert_ne!(index.enterpoint, None);
 
     // search
@@ -50,11 +53,11 @@ fn hnsw_test() {
     assert_eq!(res[4].sim.into_inner(), -16.0);
 
     // delete node
-    for i in 0..100 {
+    for i in 0..n {
         let node_name = format!("node{}", i);
         let node = index.nodes.get(&node_name).unwrap().clone();
         index.delete_node(&node_name, mock_fn).unwrap();
-        assert_eq!(index.node_count, 100 - i - 1);
+        assert_eq!(index.node_count, n - i - 1);
         assert_eq!(index.nodes.get(&node_name).is_none(), true);
         for l in &index.layers {
             assert_eq!(l.contains(&node.downgrade()), false);
@@ -66,9 +69,9 @@ fn hnsw_test() {
                 }
             }
         }
-        // sleep for a brief period to make sure all threads are done
-        let ten_millis = time::Duration::from_millis(10);
-        thread::sleep(ten_millis);
+        // // sleep for a brief period to make sure all threads are done
+        // let ten_millis = time::Duration::from_millis(10);
+        // thread::sleep(ten_millis);
         let sc = Arc::strong_count(&node.0);
         if sc > 1 {
             println!("Delete {:?}", node);
