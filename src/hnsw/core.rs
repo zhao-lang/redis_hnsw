@@ -12,7 +12,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock, Weak};
-use std::thread;
+// use std::thread;
 
 struct SelectParams {
     m: usize,
@@ -386,7 +386,7 @@ where
         &mut self,
         name: &str,
         data: &[T],
-        update_fn: fn(String, Node<T>),
+        update_fn: impl Fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         if data.len() != self.data_dim {
             return Err(format!("data dimension: {} does not match Index", data.len()).into());
@@ -416,7 +416,7 @@ where
     pub fn delete_node(
         &mut self,
         name: &str,
-        update_fn: fn(String, Node<T>),
+        update_fn: impl Fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         let node = match self.nodes.remove(name) {
             Some(node) => node,
@@ -444,7 +444,7 @@ where
         for n in updated {
             let name = n.read().name.clone();
             let node = n.clone();
-            let _ = thread::spawn(move || update_fn(name, node));
+            update_fn(name, node);
         }
 
         // update enterpoint if necessary
@@ -492,7 +492,7 @@ where
         &mut self,
         name: &str,
         data: &[T],
-        update_fn: fn(String, Node<T>),
+        update_fn: impl Fn(String, Node<T>),
     ) -> Result<(), HNSWError> {
         let l = self.gen_random_level();
         let l_max = self.max_layer;
@@ -583,7 +583,7 @@ where
         for n in updated {
             let name = n.read().name.clone();
             let node = n.clone();
-            let _ = thread::spawn(move || update_fn(name, node));
+            update_fn(name, node);
         }
 
         // new enterpoint if we're in a higher layer

@@ -93,6 +93,8 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
         return Err(RedisError::WrongArity);
     }
 
+    ctx.auto_memory();
+
     let mut indices = INDICES.write().unwrap();
     let index_name = format!("{}.{}", PREFIX, &args[1]);
 
@@ -110,29 +112,31 @@ fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     if args.len() < 2 {
         return Err(RedisError::WrongArity);
     }
-    {
-        let index_name = format!("{}.{}", PREFIX, &args[1]);
 
-        // get index from redis
-        ctx.log_debug(format!("deleting index: {}", &index_name).as_str());
-        let rkey = ctx.open_key_writable(&index_name);
+    ctx.auto_memory();
 
-        match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
-            Some(_) => rkey.delete()?,
-            None => {
-                return Err(RedisError::String(format!(
-                    "Index: {} does not exist",
-                    &args[1]
-                )));
-            }
-        };
+    let index_name = format!("{}.{}", PREFIX, &args[1]);
 
-        // get index from global hashmap
-        let mut indices = INDICES.write().unwrap();
-        indices
-            .remove(&index_name)
-            .ok_or_else(|| format!("Index: {} does not exist", &args[1]))?;
-    }
+    // get index from redis
+    ctx.log_debug(format!("deleting index: {}", &index_name).as_str());
+    let rkey = ctx.open_key_writable(&index_name);
+
+    match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
+        Some(_) => rkey.delete()?,
+        None => {
+            return Err(RedisError::String(format!(
+                "Index: {} does not exist",
+                &args[1]
+            )));
+        }
+    };
+
+    // get index from global hashmap
+    let mut indices = INDICES.write().unwrap();
+    indices
+        .remove(&index_name)
+        .ok_or_else(|| format!("Index: {} does not exist", &args[1]))?;
+
     Ok(1_usize.into())
 }
 
@@ -264,8 +268,12 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let mut indices = INDICES.write().unwrap();
     let index = load_index(ctx, & mut indices, &index_name)?;
 
+    let up = |name: String, node: Node<f32>| {
+        write_node(ctx, &name, (&node).into()).unwrap();
+    };
+
     ctx.log_debug(format!("Adding node: {} to Index: {}", &node_name, &index_name).as_str());
-    if let Err(e) = index.add_node(&node_name, &data, update_node) {
+    if let Err(e) = index.add_node(&node_name, &data, up) {
         return Err(e.error_string().into())
     }
 
@@ -274,7 +282,7 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     write_node(ctx, &node_name, node.into())?;
 
     // update index in redis
-    update_index(ctx, &index_name, & mut *index)?;
+    update_index(ctx, &index_name, index)?;
 
     Ok("OK".into())
 }
@@ -283,6 +291,8 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     if args.len() < 3 {
         return Err(RedisError::WrongArity);
     }
+
+    ctx.auto_memory();
 
     let mut indices = INDICES.write().unwrap();
     let index_name = format!("{}.{}", PREFIX, &args[1]);
@@ -299,7 +309,12 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
         )
         .into());
     }
-    if let Err(e) = index.delete_node(&node_name, update_node) {
+
+    let up = |name: String, node: Node<f32>| {
+        write_node(ctx, &name, (&node).into()).unwrap();
+    };
+    
+    if let Err(e) = index.delete_node(&node_name, up) {
         return Err(e.error_string().into())
     }
 
@@ -316,7 +331,7 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     };
 
     // update index in redis
-    update_index(ctx, &index_name, & mut *index)?;
+    update_index(ctx, &index_name, index)?;
 
     Ok(1_usize.into())
 }
@@ -325,6 +340,8 @@ fn get_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     if args.len() < 3 {
         return Err(RedisError::WrongArity);
     }
+
+    ctx.auto_memory();
 
     let node_name = format!("{}.{}.{}", PREFIX, &args[1], &args[2]);
 
@@ -361,12 +378,14 @@ fn write_node<'a>(ctx: &'a Context, key: &str, node: NodeRedis) -> RedisResult {
     Ok(key.into())
 }
 
-fn update_node(name: String, node: hnsw::Node<f32>) {
-    let ctx = Context::get_thread_safe_context();
-    ctx.lock();
-    write_node(&ctx, &name, (&node).into()).unwrap();
-    ctx.unlock();
-}
+// fn update_node(name: String, node: Node<f32>) {
+//     let ctx = Context::get_thread_safe_context();
+//     ctx.auto_memory();
+//     ctx.lock();
+//     write_node(&ctx, &name, (&node).into()).unwrap();
+//     ctx.unlock();
+//     ctx.free_thread_safe_context();
+// }
 
 fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
     if args.len() < 4 {

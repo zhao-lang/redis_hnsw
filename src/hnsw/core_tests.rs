@@ -26,9 +26,9 @@ fn hnsw_test() {
         let data = vec![i as f32; data_dim];
         index.add_node(&name, &data, mock_fn).unwrap();
     }
-    // sleep for a brief period to make sure all threads are done
-    let ten_millis = time::Duration::from_millis(1000);
-    thread::sleep(ten_millis);
+    // // sleep for a brief period to make sure all threads are done
+    // let ten_millis = time::Duration::from_millis(10);
+    // thread::sleep(ten_millis);
     for i in 0..n {
         let node_name = format!("node{}", i);
         let node = index.nodes.get(&node_name).unwrap();
@@ -69,9 +69,9 @@ fn hnsw_test() {
                 }
             }
         }
-        // sleep for a brief period to make sure all threads are done
-        let ten_millis = time::Duration::from_millis(10);
-        thread::sleep(ten_millis);
+        // // sleep for a brief period to make sure all threads are done
+        // let ten_millis = time::Duration::from_millis(10);
+        // thread::sleep(ten_millis);
         let sc = Arc::strong_count(&node.0);
         if sc > 1 {
             println!("Delete {:?}", node);
