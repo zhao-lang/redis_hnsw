@@ -1,5 +1,4 @@
 use super::metrics;
-use crate::types;
 
 use num::Float;
 use ordered_float::OrderedFloat;
@@ -318,7 +317,7 @@ pub struct Index<T: Float, R: Float> {
     pub layers: Vec<HashSet<NodeWeak<T>>>,      // distinct nodes in each layer
     pub nodes: HashMap<String, Node<T>>,        // hashmap of nodes
     pub enterpoint: Option<NodeWeak<T>>,        // enterpoint node
-    rng_: StdRng,                               // rng for level generation
+    pub rng_: StdRng,                           // rng for level generation
 }
 
 impl<T: Float, R: Float> Index<T, R> {
@@ -375,35 +374,6 @@ impl<T: Float, R: Float> fmt::Debug for Index<T, R> {
                 None => "null".to_owned(),
             },
         )
-    }
-}
-
-impl From<&types::IndexRedis> for Index<f32, f32> {
-    fn from(index: &types::IndexRedis) -> Self {
-        Index {
-            name: index.name.clone(),
-            mfunc: match index.mfunc_kind.as_str() {
-                "Euclidean" => Box::new(metrics::euclidean),
-                _ => Box::new(metrics::euclidean),
-            },
-            mfunc_kind: match index.mfunc_kind.as_str() {
-                "Euclidean" => metrics::MetricFuncs::Euclidean,
-                _ => metrics::MetricFuncs::Euclidean,
-            },
-            data_dim: index.data_dim,
-            m: index.m,
-            m_max: index.m_max,
-            m_max_0: index.m_max_0,
-            ef_construction: index.ef_construction,
-            level_mult: index.level_mult,
-            node_count: index.node_count,
-            max_layer: index.max_layer,
-            // the next 3 need to be populated from redis
-            layers: Vec::new(),
-            nodes: HashMap::new(),
-            enterpoint: None,
-            rng_: StdRng::from_entropy(),
-        }
     }
 }
 
