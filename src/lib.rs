@@ -18,7 +18,7 @@ use hnsw::{Index, Node};
 use redis_module::{
     Context, RedisError, RedisResult, RedisValue,
 };
-use redismodule_cmd::Command;
+use redismodule_cmd::{Command, ArgType, Collection};
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
@@ -26,7 +26,6 @@ use types::*;
 
 static PREFIX: &str = "hnsw";
 
-// type IndexArc = Arc<RwLock<Index<f32, f32>>>;
 type IndexT = Index<f32, f32>;
 
 lazy_static! {
@@ -38,58 +37,58 @@ thread_local! {
     static NEW_INDEX_CMD: Command = command!{
         name: "hnsw.new",
         args: [
-            ["name", String, false, None, false],
-            ["dim", u64, false, None, true],
-            ["m", u64, false, Some(Box::new(5_u64)), true],
-            ["efcon", u64, false, Some(Box::new(200_u64)), true],
+            ["name", ArgType::Arg, String, Collection::Unit, None],
+            ["dim", ArgType::Kwarg, u64, Collection::Unit, None],
+            ["m", ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(5_u64))],
+            ["efcon", ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(200_u64))],
         ],
     };
 
     static GET_INDEX_CMD: Command = command!{
         name: "hnsw.get",
         args: [
-            ["name", String, false, None, false],
+            ["name", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
     static DEL_INDEX_CMD: Command = command!{
         name: "hnsw.del",
         args: [
-            ["name", String, false, None, false],
+            ["name", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
     static ADD_NODE_CMD: Command = command!{
         name: "hnsw.node.add",
         args: [
-            ["index", String, false, None, false],
-            ["node", String, false, None, false],
-            ["data", f64, true, None, true],
+            ["index", ArgType::Arg, String, Collection::Unit, None],
+            ["node", ArgType::Arg, String, Collection::Unit, None],
+            ["data", ArgType::Kwarg, f64, Collection::Vec, None],
         ],
     };
 
     static GET_NODE_CMD: Command = command!{
         name: "hnsw.node.get",
         args: [
-            ["index", String, false, None, false],
-            ["node", String, false, None, false],
+            ["index", ArgType::Arg, String, Collection::Unit, None],
+            ["node", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
     static DEL_NODE_CMD: Command = command!{
         name: "hnsw.node.del",
         args: [
-            ["index", String, false, None, false],
-            ["node", String, false, None, false],
+            ["index", ArgType::Arg, String, Collection::Unit, None],
+            ["node", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
     static SEARCH_CMD: Command = command!{
         name: "hnsw.search",
         args: [
-            ["index", String, false, None, false],
-            ["k", u64, false, Some(Box::new(5_u64)), true],
-            ["query", f64, true, None, true],
+            ["index", ArgType::Arg, String, Collection::Unit, None],
+            ["k", ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(5_u64))],
+            ["query", ArgType::Kwarg, f64, Collection::Vec, None],
         ],
     };
 }
