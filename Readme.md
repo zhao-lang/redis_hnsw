@@ -9,13 +9,13 @@ Build the module - `cargo build`
 Load the module - `redis-server --loadmodule ./target/<build_mode>/libredis_hnsw.<dylib|so>`
 
 ### Redis commands
-Creating a new index - `hnsw.new <index_name> <data_dim_> <M> <ef_construction>`
+Creating a new index - `hnsw.new {index_name} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]`
 
-Add nodes - `hnsw.node.add <index_name> <node_name> <...data>`
+Add nodes - `hnsw.node.add {index_name} {node_name} [DATA {dim} {...data}]`
 
-Delete nodes - `hnsw.node.del <index_name> <node_name>`
+Delete nodes - `hnsw.node.del {index_name} {node_name}`
 
-Search KNN - `hnsw.search <index_name> <k> <..data>`
+Search KNN - `hnsw.search {index_name} [K {k}] [DATA {dim} {...data}]`
 
 
 ## Command Reference
@@ -23,19 +23,19 @@ Search KNN - `hnsw.search <index_name> <k> <..data>`
 ### HNSW.NEW
 #### Format
 ```
-HNSW.NEW {index} [DATA_DIM] [M] [EF_CONSTRUCTION]
+HNSW.NEW {index} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]
 ```
 #### Description
 Creates an HNSW index 
 #### Example
 ```
-HNSW.NEW foo 128 5 200
+HNSW.NEW foo DIM 128 M 5 EFCON 200
 ```
 #### Parameters
-* **index**: name of the new index.
-* **DATA_DIM**: dimensionality of the data.
-* **M**: algorithm parameter for the number of neighbors to select for each node.
-* **EF_CONSTRUCTION**: algorithm parameter for the size of the dynamic candidate list.
+* **index**: required, name of the new index.
+* **DIM**: required, dimensionality of the data.
+* **M**: optional, algorithm parameter for the number of neighbors to select for each node.
+* **EFCON**: optional, algorithm parameter for the size of the dynamic candidate list.
 #### Complexity
 O(1)
 #### Returns
@@ -53,7 +53,7 @@ Retrieves an HNSW index
 HNSW.GET foo
 ```
 #### Parameters
-* **index**: name of the index.
+* **index**: required, name of the index.
 #### Complexity
 O(1)
 #### Returns
@@ -71,7 +71,7 @@ Deletes an HNSW index
 HNSW.DEL foo
 ```
 #### Parameters
-* **index**: name of the index.
+* **index**: required, name of the index.
 #### Complexity
 O(1)
 #### Returns
@@ -80,18 +80,18 @@ OK or an error
 ### HNSW.NODE.ADD
 #### Format
 ```
-HNSW.NODE.ADD {index} {node} {...DATA}
+HNSW.NODE.ADD {index} {node} [DATA {dim} {...data}]
 ```
 #### Description
 Adds an element to the index 
 #### Example
 ```
-HNSW.NODE.ADD foo bar 1.0 1.0 1.0 1.0
+HNSW.NODE.ADD foo bar DATA 4 1.0 1.0 1.0 1.0
 ```
 #### Parameters
-* **index**: name of the index
-* **node**: name of the new node
-* **DATA**: space separated vector of data. Total entries must match `DATA_DIM` of index
+* **index**: required, name of the index
+* **node**: required, name of the new node
+* **DATA**: required, dimensionality followed by a space separated vector of data. Total entries must match `DIM` of index
 #### Complexity
 O(log(n)) where n is the number of nodes in the index
 #### Returns
@@ -109,8 +109,8 @@ Retrieves an element from the index
 HNSW.NODE.GET foo bar
 ```
 #### Parameters
-* **index**: name of the index
-* **node**: name of the node
+* **index**: required, name of the index
+* **node**: required, name of the node
 #### Complexity
 O(1)
 #### Returns
@@ -128,8 +128,8 @@ Removes an element from the index
 HNSW.NODE.DEL foo bar
 ```
 #### Parameters
-* **index**: name of the index
-* **node**: name of the node
+* **index**: required, name of the index
+* **node**: required, name of the node
 #### Complexity
 O(log(n)) where n is the number of nodes in the index
 #### Returns
@@ -138,18 +138,18 @@ OK or an error
 ### HNSW.SEARCH
 #### Format
 ```
-HNSW.SEARCH {index} {K} {...DATA}
+HNSW.SEARCH {index} [K {k}] [QUERY {dim} {...data}]
 ```
 #### Description
 Search the index for the K nearest elements to the query
 #### Example
 ```
-HNSW.SEARCH foo 5 0.0 0.0 0.0 0.0
+HNSW.SEARCH foo K 5 QUERY 4 0.0 0.0 0.0 0.0
 ```
 #### Parameters
-* **index**: name of the index
-* **K**: number of nearest neighbors to return
-* **DATA**: space separated vector of query data. Total entries must match `DATA_DIM` of index
+* **index**: required, name of the index
+* **K**: required, number of nearest neighbors to return
+* **DATA**: required, dimensionality followed by space separated vector of query data. Total entries must match `DIM` of index
 #### Complexity
 O(log(n)) where n is the number of nodes in the index
 #### Returns

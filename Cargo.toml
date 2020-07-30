@@ -10,7 +10,8 @@ edition = "2018"
 crate-type=["cdylib"]
 
 [dependencies]
-redis-module = { version = "0.7.0", features = ["experimental-api"] }
+redis-module = { version = "0.10.0", features = ["experimental-api"] }
+redismodule_cmd = { git="https://github.com/zhao-lang/redismodule-cmd" }
 lazy_static = "1.4.0"
 rand = "0.7.3"
 ordered-float = "1.0.2"
