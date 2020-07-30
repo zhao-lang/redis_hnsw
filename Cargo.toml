@@ -17,3 +17,6 @@ rand = "0.7.3"
 ordered-float = "1.0.2"
 owning_ref = "0.4.1"
 num = "0.2.1"
+
+[dev-dependencies]
+redis-module = { version = "0.10.0", features = ["test"] }
