@@ -21,15 +21,16 @@ use redis_module::{
 use redismodule_cmd::{Command, ArgType, Collection};
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, RwLock};
 use types::*;
 
 static PREFIX: &str = "hnsw";
 
+type IndexArc = Arc<RwLock<IndexT>>;
 type IndexT = Index<f32, f32>;
 
 lazy_static! {
-    static ref INDICES: Arc<RwLock<HashMap<String, IndexT>>> =
+    static ref INDICES: Arc<RwLock<HashMap<String, IndexArc>>> =
         Arc::new(RwLock::new(HashMap::new()));
 }
 
@@ -118,7 +119,7 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
         }
         None => {
             // create index
-            let mut index = Index::new(
+            let index = Index::new(
                 &index_name,
                 Box::new(hnsw::metrics::euclidean),
                 data_dim,
@@ -126,12 +127,12 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
                 ef_construction,
             );
             ctx.log_debug(format!("{:?}", index).as_str());
-            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, (& mut index).into())?;
+            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, (&index).into())?;
             // Add index to global hashmap
             INDICES
                 .write()
                 .unwrap()
-                .insert(index_name, index);
+                .insert(index_name, Arc::new(RwLock::new(index)));
         }
     }
 
@@ -148,14 +149,17 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
     let index_name = format!("{}.{}", PREFIX, name_suffix);
 
-    let mut indices = INDICES.write().unwrap();
+    let index = load_index(ctx, &index_name)?;
+    let index = match index.try_read() {
+        Ok(index) => index,
+        Err(e) => return Err(e.to_string().into())
+    };
 
-    let index = load_index(ctx, & mut indices, &index_name)?;
     ctx.log_debug(format!("Index: {:?}", index).as_str());
     ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
     ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
 
-    let index_redis: IndexRedis = index.into();
+    let index_redis: IndexRedis = (&*index).into();
 
     Ok(index_redis.as_redisvalue())
 }
@@ -193,7 +197,8 @@ fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     Ok(1_usize.into())
 }
 
-fn load_index<'a>(ctx: &Context, indices: &'a mut RwLockWriteGuard<HashMap<String, IndexT>>, index_name: &str) -> Result<&'a mut IndexT, RedisError> {
+fn load_index(ctx: &Context, index_name: &str) -> Result<IndexArc, RedisError> {
+    let mut indices = INDICES.write().unwrap();
     // check if index is in global hashmap
     let index = match indices.entry(index_name.to_string()) {
         Entry::Occupied(o) => o.into_mut(),
@@ -208,11 +213,11 @@ fn load_index<'a>(ctx: &Context, indices: &'a mut RwLockWriteGuard<HashMap<Strin
                 None => return Err(format!("Index: {} does not exist", index_name).into()),
             };
             let index = make_index(ctx, index_redis)?;
-            v.insert(index)
+            v.insert(Arc::new(RwLock::new(index)))
         }
     };
 
-    Ok(index)
+    Ok(index.clone())
 }
 
 fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
@@ -284,13 +289,13 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
 fn update_index(
     ctx: &Context,
     index_name: &str,
-    index: & mut IndexT,
+    index: &IndexT,
 ) -> Result<(), RedisError> {
     let key = ctx.open_key_writable(index_name);
     match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(_) => {
             ctx.log_debug(format!("update index: {}", index_name).as_str());
-            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, index.into())?;
+            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, (&*index).into())?;
         }
         None => {
             return Err(RedisError::String(format!(
@@ -318,8 +323,11 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let dataf64 = parsed.remove("data").unwrap().as_f64vec()?;
     let data = dataf64.iter().map(|d| *d as f32).collect::<Vec<f32>>();
 
-    let mut indices = INDICES.write().unwrap();
-    let index = load_index(ctx, & mut indices, &index_name)?;
+    let index = load_index(ctx, &index_name)?;
+    let mut index = match index.try_write() {
+        Ok(index) => index,
+        Err(e) => return Err(e.to_string().into())
+    };
 
     let up = |name: String, node: Node<f32>| {
         write_node(ctx, &name, (&node).into()).unwrap();
@@ -335,7 +343,7 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     write_node(ctx, &node_name, node.into())?;
 
     // update index in redis
-    update_index(ctx, &index_name, index)?;
+    update_index(ctx, &index_name, &index)?;
 
     Ok("OK".into())
 }
@@ -350,12 +358,15 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let node_suffix = parsed.remove("node").unwrap().as_string()?;
 
-    let mut indices = INDICES.write().unwrap();
     let index_name = format!("{}.{}", PREFIX, index_suffix);
-    let index = load_index(ctx, & mut indices, &index_name)?;
-
     let node_name = format!("{}.{}.{}", PREFIX, index_suffix, node_suffix);
 
+    let index = load_index(ctx, &index_name)?;
+    let mut index = match index.try_write() {
+        Ok(index) => index,
+        Err(e) => return Err(e.to_string().into())
+    };
+    
     // TODO return error if node has more than 1 strong_count
     let node = index.nodes.get(&node_name).unwrap();
     if Arc::strong_count(&node.0) > 1 {
@@ -387,7 +398,7 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     };
 
     // update index in redis
-    update_index(ctx, &index_name, index)?;
+    update_index(ctx, &index_name, &index)?;
 
     Ok(1_usize.into())
 }
@@ -449,9 +460,12 @@ fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
     let dataf64 = parsed.remove("query").unwrap().as_f64vec()?;
     let data = dataf64.iter().map(|d| *d as f32).collect::<Vec<f32>>();
 
-    let mut indices = INDICES.write().unwrap();
     let index_name = format!("{}.{}", PREFIX, index_suffix);
-    let index = load_index(ctx, & mut indices, &index_name)?;
+    let index = load_index(ctx, &index_name)?;
+    let index = match index.try_read() {
+        Ok(index) => index,
+        Err(e) => return Err(e.to_string().into())
+    };
 
     ctx.log_debug(
         format!(
