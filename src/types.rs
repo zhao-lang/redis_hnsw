@@ -1,6 +1,7 @@
 use redis_module::native_types::RedisType;
 use redis_module::{raw, RedisString, RedisValue};
 
+use num::Float;
 use rand::prelude::*;
 use std::collections::HashMap;
 use std::convert::From;
@@ -12,8 +13,8 @@ use super::hnsw::{Index, Node, SearchResult, metrics};
 static INDEX_VERSION: i32 = 0;
 static NODE_VERSION: i32 = 0;
 
-impl From<&IndexRedis> for Index<f32, f32> {
-    fn from(index: &IndexRedis) -> Self {
+impl From<IndexRedis> for Index<f32, f32> {
+    fn from(index: IndexRedis) -> Self {
         Index {
             name: index.name.clone(),
             mfunc: match index.mfunc_kind.as_str() {
@@ -41,7 +42,7 @@ impl From<&IndexRedis> for Index<f32, f32> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct IndexRedis {
     pub name: String,               // index name
     pub mfunc_kind: String,         // kind of the metric function
@@ -58,8 +59,8 @@ pub struct IndexRedis {
     pub enterpoint: Option<String>, // string key to the enterpoint node
 }
 
-impl From<&Index<f32, f32>> for IndexRedis {
-    fn from(index: &Index<f32, f32>) -> Self {
+impl<T: Float, R: Float> From<Index<T, R>> for IndexRedis {
+    fn from(index: Index<T, R>) -> Self {
         IndexRedis {
             name: index.name.clone(),
             mfunc_kind: format!("{:?}", index.mfunc_kind),
@@ -122,36 +123,36 @@ impl fmt::Debug for IndexRedis {
     }
 }
 
-impl IndexRedis {
-    pub fn as_redisvalue(&self) -> RedisValue {
+impl From<IndexRedis> for RedisValue {
+    fn from(index: IndexRedis) -> Self {
         let mut reply: Vec<RedisValue> = Vec::new();
 
         reply.push("name".into());
-        reply.push(self.name.as_str().into());
+        reply.push(index.name.as_str().into());
 
         reply.push("metric".into());
-        reply.push(self.mfunc_kind.as_str().into());
+        reply.push(index.mfunc_kind.as_str().into());
 
         reply.push("data_dim".into());
-        reply.push(self.data_dim.into());
+        reply.push(index.data_dim.into());
 
         reply.push("m".into());
-        reply.push(self.m.into());
+        reply.push(index.m.into());
 
         reply.push("ef_construction".into());
-        reply.push(self.ef_construction.into());
+        reply.push(index.ef_construction.into());
 
         reply.push("level_mult".into());
-        reply.push(self.level_mult.into());
+        reply.push(index.level_mult.into());
 
         reply.push("node_count".into());
-        reply.push(self.node_count.into());
+        reply.push(index.node_count.into());
 
         reply.push("max_layer".into());
-        reply.push(self.max_layer.into());
+        reply.push(index.max_layer.into());
 
         reply.push("enterpoint".into());
-        reply.push(self.enterpoint.clone().into());
+        reply.push(index.enterpoint.into());
 
         reply.into()
     }
@@ -322,13 +323,13 @@ impl fmt::Debug for NodeRedis {
     }
 }
 
-impl NodeRedis {
-    pub fn as_redisvalue(&self) -> RedisValue {
+impl From<&NodeRedis> for RedisValue {
+    fn from(n: &NodeRedis) -> Self {
         let mut reply: Vec<RedisValue> = Vec::new();
 
         reply.push("data".into());
         reply.push(
-            self.data
+            n.data
                 .iter()
                 .map(|x| *x as f64)
                 .collect::<Vec<f64>>()
@@ -337,7 +338,7 @@ impl NodeRedis {
 
         reply.push("neighbors".into());
         reply.push(
-            self.neighbors
+            n.neighbors
                 .iter()
                 .map(|layer| {
                     layer
@@ -445,15 +446,15 @@ impl From<&SearchResult<f32, f32>> for SearchResultRedis {
     }
 }
 
-impl SearchResultRedis {
-    pub fn as_redisvalue(&self) -> RedisValue {
+impl From<SearchResultRedis> for RedisValue {
+    fn from(sr: SearchResultRedis) -> Self {
         let mut reply: Vec<RedisValue> = Vec::new();
 
         reply.push("similarity".into());
-        reply.push(self.sim.into());
+        reply.push(sr.sim.into());
 
         reply.push("name".into());
-        reply.push(self.name.as_str().into());
+        reply.push(sr.name.as_str().into());
 
         reply.into()
     }

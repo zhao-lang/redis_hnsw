@@ -302,6 +302,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct Index<T: Float, R: Float> {
     pub name: String,                           // index name
     pub mfunc: Box<metrics::MetricFuncT<T, R>>, // metric function
