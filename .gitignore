@@ -14,3 +14,4 @@ Cargo.lock
 
 *.rdb
 *.aof
+/doc/COMMAND_REFERENCE_GEN.md
