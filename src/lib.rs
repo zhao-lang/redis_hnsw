@@ -18,7 +18,7 @@ use hnsw::{Index, Node};
 use redis_module::{
     Context, RedisError, RedisResult, RedisValue,
 };
-use redismodule_cmd::{Command, ArgType, Collection};
+use redismodule_cmd::{Command, ArgType, Collection, rediscmd_doc};
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, RwLock};
@@ -35,61 +35,95 @@ lazy_static! {
 }
 
 thread_local! {
+    #[rediscmd_doc(clean)]
     static NEW_INDEX_CMD: Command = command!{
         name: "hnsw.new",
+        desc: "Create a new HNSW index.",
         args: [
-            ["name", ArgType::Arg, String, Collection::Unit, None],
-            ["dim", ArgType::Kwarg, u64, Collection::Unit, None],
-            ["m", ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(5_u64))],
-            ["efcon", ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(200_u64))],
+            ["name", "Name of the index.", ArgType::Arg, String, Collection::Unit, None],
+            ["dim", "Dimensionality of the data.", ArgType::Kwarg, u64, Collection::Unit, None],
+            [
+                "m",
+                "Parameter for the number of neighbors to select for each node.",
+                ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(5_u64))
+            ],
+            [
+                "efcon",
+                "Parameter for the size of the dynamic candidate list.",
+                ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(200_u64))
+            ],
         ],
     };
 
+    #[rediscmd_doc]
     static GET_INDEX_CMD: Command = command!{
         name: "hnsw.get",
+        desc: "Retrieve an HNSW index.",
         args: [
-            ["name", ArgType::Arg, String, Collection::Unit, None],
+            ["name", "Name of the index.", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
+    #[rediscmd_doc]
     static DEL_INDEX_CMD: Command = command!{
         name: "hnsw.del",
+        desc: "Delete an HNSW index.",
         args: [
-            ["name", ArgType::Arg, String, Collection::Unit, None],
+            ["name", "Name of the index.", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
+    #[rediscmd_doc]
     static ADD_NODE_CMD: Command = command!{
         name: "hnsw.node.add",
+        desc: "Add a node to the index.",
         args: [
-            ["index", ArgType::Arg, String, Collection::Unit, None],
-            ["node", ArgType::Arg, String, Collection::Unit, None],
-            ["data", ArgType::Kwarg, f64, Collection::Vec, None],
+            ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
+            ["node", "name of the node", ArgType::Arg, String, Collection::Unit, None],
+            [
+                "data",
+                "Dimensionality followed by a space separated vector of data. Total entries must match `DIM` of index",
+                ArgType::Kwarg, f64, Collection::Vec, None
+            ],
         ],
     };
 
+    #[rediscmd_doc]
     static GET_NODE_CMD: Command = command!{
         name: "hnsw.node.get",
+        desc: "Retrieve a node from the index.",
         args: [
-            ["index", ArgType::Arg, String, Collection::Unit, None],
-            ["node", ArgType::Arg, String, Collection::Unit, None],
+            ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
+            ["node", "name of the node", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
+    #[rediscmd_doc]
     static DEL_NODE_CMD: Command = command!{
         name: "hnsw.node.del",
+        desc: "Delete a node from the index.",
         args: [
-            ["index", ArgType::Arg, String, Collection::Unit, None],
-            ["node", ArgType::Arg, String, Collection::Unit, None],
+            ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
+            ["node", "name of the node", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
+    #[rediscmd_doc]
     static SEARCH_CMD: Command = command!{
         name: "hnsw.search",
+        desc: "Search the index for the K nearest elements to the query.",
         args: [
-            ["index", ArgType::Arg, String, Collection::Unit, None],
-            ["k", ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(5_u64))],
-            ["query", ArgType::Kwarg, f64, Collection::Vec, None],
+            ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
+            [
+                "k",
+                "number of nearest neighbors to return",
+                ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(5_u64))
+            ],
+            [
+                "query",
+                "Dimensionality followed by a space separated vector of data. Total entries must match `DIM` of index",
+                ArgType::Kwarg, f64, Collection::Vec, None
+            ],
         ],
     };
 }
