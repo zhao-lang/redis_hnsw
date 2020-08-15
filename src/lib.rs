@@ -1,5 +1,3 @@
-#![feature(thread_local_internals)]
-
 mod hnsw;
 mod types;
 

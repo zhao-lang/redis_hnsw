@@ -11,7 +11,7 @@ crate-type=["cdylib"]
 
 [dependencies]
 redis-module = { version = "0.10.0", features = ["experimental-api"] }
-redismodule_cmd = { git = "https://github.com/zhao-lang/redismodule-cmd", features = ["docgen"] }
+redismodule_cmd = { version = "0.1.0", features = ["docgen"] }
 lazy_static = "1.4.0"
 rand = "0.7.3"
 ordered-float = "1.0.2"
