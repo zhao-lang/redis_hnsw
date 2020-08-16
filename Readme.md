@@ -1,14 +1,37 @@
+[![licence](https://img.shields.io/github/license/zhao-lang/redis_hnsw.svg)](https://github.com/zhao-lang/redis_hnsw/blob/master/LICENSE)
+[![release](https://img.shields.io/github/v/release/zhao-lang/redis_hnsw.svg)](https://github.com/zhao-lang/redis_hnsw/releases/latest)
+[![rust](https://github.com/zhao-lang/redis_hnsw/workflows/Rust/badge.svg)](https://github.com/zhao-lang/redis_hnsw/actions?query=workflow%3ARust)
+
 # HNSW for Redis
+<a id="markdown-hnsw-for-redis" name="hnsw-for-redis"></a>
 
 `redis_hnsw` is a Hierarchical Navigable Small World (HNSW) implementation for Redis. Based on the paper [Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320). Currently only supports Euclidean distance, Hamming distance forthcoming.
 
+<!-- TOC -->
+## Table of Contents
+
+- [Getting Started](#getting-started)
+    - [Redis commands](#redis-commands)
+- [Command Reference](#command-reference)
+    - [HNSW.NEW](#hnswnew)
+    - [HNSW.GET](#hnswget)
+    - [HNSW.DEL](#hnswdel)
+    - [HNSW.NODE.ADD](#hnswnodeadd)
+    - [HNSW.NODE.GET](#hnswnodeget)
+    - [HNSW.NODE.DEL](#hnswnodedel)
+    - [HNSW.SEARCH](#hnswsearch)
+
+<!-- /TOC -->
+
 ## Getting Started
+<a id="markdown-getting-started" name="getting-started"></a>
 
 Build the module - `cargo build`
 
 Load the module - `redis-server --loadmodule ./target/<build_mode>/libredis_hnsw.<dylib|so>`
 
 ### Redis commands
+<a id="markdown-redis-commands" name="redis-commands"></a>
 Creating a new index - `hnsw.new {index_name} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]`
 
 Add nodes - `hnsw.node.add {index_name} {node_name} [DATA {dim} {...data}]`
@@ -19,8 +42,10 @@ Search KNN - `hnsw.search {index_name} [K {k}] [DATA {dim} {...data}]`
 
 
 ## Command Reference
+<a id="markdown-command-reference" name="command-reference"></a>
 
 ### HNSW.NEW
+<a id="markdown-hnsw.new" name="hnsw.new"></a>
 #### Format
 ```
 HNSW.NEW {index} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]
@@ -42,6 +67,7 @@ O(1)
 OK or an error
 
 ### HNSW.GET
+<a id="markdown-hnsw.get" name="hnsw.get"></a>
 #### Format
 ```
 HNSW.GET {index}
@@ -60,6 +86,7 @@ O(1)
 **Array Reply** key-value pairs of index attributes
 
 ### HNSW.DEL
+<a id="markdown-hnsw.del" name="hnsw.del"></a>
 #### Format
 ```
 HNSW.DEL {index}
@@ -78,6 +105,7 @@ O(1)
 OK or an error
 
 ### HNSW.NODE.ADD
+<a id="markdown-hnsw.node.add" name="hnsw.node.add"></a>
 #### Format
 ```
 HNSW.NODE.ADD {index} {node} [DATA {dim} {...data}]
@@ -98,6 +126,7 @@ O(log(n)) where n is the number of nodes in the index
 OK or an error
 
 ### HNSW.NODE.GET
+<a id="markdown-hnsw.node.get" name="hnsw.node.get"></a>
 #### Format
 ```
 HNSW.NODE.GET {index} {node}
@@ -117,6 +146,7 @@ O(1)
 **Array Reply** key-value pairs of node attributes
 
 ### HNSW.NODE.DEL
+<a id="markdown-hnsw.node.del" name="hnsw.node.del"></a>
 #### Format
 ```
 HNSW.NODE.DEL {index} {node}
@@ -136,6 +166,7 @@ O(log(n)) where n is the number of nodes in the index
 OK or an error
 
 ### HNSW.SEARCH
+<a id="markdown-hnsw.search" name="hnsw.search"></a>
 #### Format
 ```
 HNSW.SEARCH {index} [K {k}] [QUERY {dim} {...data}]
