@@ -1,3 +1,6 @@
+# must first enable word splitting if using zsh, uncomment next line
+# setopt SH_WORD_SPLIT
+
 redis-cli HNSW.NEW test1 DIM 128 M 5
 
 for i in {1..100}
