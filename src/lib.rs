@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 mod hnsw;
 mod types;
 
@@ -15,12 +17,10 @@ extern crate ordered_float;
 extern crate owning_ref;
 
 use hnsw::{Index, Node};
-use redis_module::{
-    Context, RedisError, RedisResult, RedisValue,
-};
-use redismodule_cmd::{Command, ArgType, Collection, rediscmd_doc};
-use std::collections::{HashMap, HashSet};
+use redis_module::{Context, RedisError, RedisResult, RedisValue};
+use redismodule_cmd::{rediscmd_doc, ArgType, Collection, Command};
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use types::*;
 
@@ -128,13 +128,10 @@ thread_local! {
     };
 }
 
-
 fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.auto_memory();
 
-    let mut parsed = NEW_INDEX_CMD.with(|cmd| {
-        cmd.parse_args(args)
-    })?;
+    let mut parsed = NEW_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
     let index_name = format!("{}.{}", PREFIX, name_suffix);
@@ -176,9 +173,7 @@ fn new_index(ctx: &Context, args: Vec<String>) -> RedisResult {
 fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.auto_memory();
 
-    let mut parsed = GET_INDEX_CMD.with(|cmd| {
-        cmd.parse_args(args)
-    })?;
+    let mut parsed = GET_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
     let index_name = format!("{}.{}", PREFIX, name_suffix);
@@ -186,7 +181,7 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     let index = load_index(ctx, &index_name)?;
     let index = match index.try_read() {
         Ok(index) => index,
-        Err(e) => return Err(e.to_string().into())
+        Err(e) => return Err(e.to_string().into()),
     };
 
     ctx.log_debug(format!("Index: {:?}", index).as_str());
@@ -201,9 +196,7 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
 fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.auto_memory();
 
-    let mut parsed = DEL_INDEX_CMD.with(|cmd| {
-        cmd.parse_args(args)
-    })?;
+    let mut parsed = DEL_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
     let index_name = format!("{}.{}", PREFIX, name_suffix);
@@ -320,11 +313,7 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
     Ok(index)
 }
 
-fn update_index(
-    ctx: &Context,
-    index_name: &str,
-    index: &IndexT,
-) -> Result<(), RedisError> {
+fn update_index(ctx: &Context, index_name: &str, index: &IndexT) -> Result<(), RedisError> {
     let key = ctx.open_key_writable(index_name);
     match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
         Some(_) => {
@@ -344,9 +333,7 @@ fn update_index(
 fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.auto_memory();
 
-    let mut parsed = ADD_NODE_CMD.with(|cmd| {
-        cmd.parse_args(args)
-    })?;
+    let mut parsed = ADD_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let node_suffix = parsed.remove("node").unwrap().as_string()?;
@@ -360,7 +347,7 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let index = load_index(ctx, &index_name)?;
     let mut index = match index.try_write() {
         Ok(index) => index,
-        Err(e) => return Err(e.to_string().into())
+        Err(e) => return Err(e.to_string().into()),
     };
 
     let up = |name: String, node: Node<f32>| {
@@ -369,7 +356,7 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     ctx.log_debug(format!("Adding node: {} to Index: {}", &node_name, &index_name).as_str());
     if let Err(e) = index.add_node(&node_name, &data, up) {
-        return Err(e.error_string().into())
+        return Err(e.error_string().into());
     }
 
     // write node to redis
@@ -385,9 +372,7 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.auto_memory();
 
-    let mut parsed = DEL_NODE_CMD.with(|cmd| {
-        cmd.parse_args(args)
-    })?;
+    let mut parsed = DEL_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let node_suffix = parsed.remove("node").unwrap().as_string()?;
@@ -398,9 +383,9 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let index = load_index(ctx, &index_name)?;
     let mut index = match index.try_write() {
         Ok(index) => index,
-        Err(e) => return Err(e.to_string().into())
+        Err(e) => return Err(e.to_string().into()),
     };
-    
+
     // TODO return error if node has more than 1 strong_count
     let node = index.nodes.get(&node_name).unwrap();
     if Arc::strong_count(&node.0) > 1 {
@@ -414,9 +399,9 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let up = |name: String, node: Node<f32>| {
         write_node(ctx, &name, (&node).into()).unwrap();
     };
-    
+
     if let Err(e) = index.delete_node(&node_name, up) {
-        return Err(e.error_string().into())
+        return Err(e.error_string().into());
     }
 
     ctx.log_debug(format!("del key: {}", &node_name).as_str());
@@ -440,9 +425,7 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 fn get_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.auto_memory();
 
-    let mut parsed = GET_NODE_CMD.with(|cmd| {
-        cmd.parse_args(args)
-    })?;
+    let mut parsed = GET_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let node_suffix = parsed.remove("node").unwrap().as_string()?;
@@ -485,9 +468,7 @@ fn write_node<'a>(ctx: &'a Context, key: &str, node: NodeRedis) -> RedisResult {
 fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
     ctx.auto_memory();
 
-    let mut parsed = SEARCH_CMD.with(|cmd| {
-        cmd.parse_args(args)
-    })?;
+    let mut parsed = SEARCH_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let k = parsed.remove("k").unwrap().as_u64()? as usize;
@@ -498,7 +479,7 @@ fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
     let index = load_index(ctx, &index_name)?;
     let index = match index.try_read() {
         Ok(index) => index,
-        Err(e) => return Err(e.to_string().into())
+        Err(e) => return Err(e.to_string().into()),
     };
 
     ctx.log_debug(
@@ -511,15 +492,13 @@ fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     match index.search_knn(&data, k) {
         Ok(res) => {
-            {
-                let mut reply: Vec<RedisValue> = Vec::new();
-                reply.push(res.len().into());
-                for r in &res {
-                    let sr: SearchResultRedis = r.into();
-                    reply.push(sr.into());
-                }
-                Ok(reply.into())
+            let mut reply: Vec<RedisValue> = Vec::new();
+            reply.push(res.len().into());
+            for r in &res {
+                let sr: SearchResultRedis = r.into();
+                reply.push(sr.into());
             }
+            Ok(reply.into())
         }
         Err(e) => Err(e.error_string().into()),
     }

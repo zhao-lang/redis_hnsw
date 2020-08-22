@@ -45,12 +45,12 @@ fn hnsw_test() {
     let query = vec![10.0; 4];
     let res = index.search_knn(&query, 5).unwrap();
     assert_eq!(res.len(), 5);
-    assert_eq!(res[0].sim.into_inner(), 0.0);
+    assert!((res[0].sim.into_inner() - 0.0).abs() < f32::EPSILON);
     assert_eq!(res[0].name.as_str(), "node10");
-    assert_eq!(res[1].sim.into_inner(), -4.0);
-    assert_eq!(res[2].sim.into_inner(), -4.0);
-    assert_eq!(res[3].sim.into_inner(), -16.0);
-    assert_eq!(res[4].sim.into_inner(), -16.0);
+    assert!((res[1].sim.into_inner() - -4.0).abs() < f32::EPSILON);
+    assert!((res[2].sim.into_inner() - -4.0).abs() < f32::EPSILON);
+    assert!((res[3].sim.into_inner() - -16.0).abs() < f32::EPSILON);
+    assert!((res[4].sim.into_inner() - -16.0).abs() < f32::EPSILON);
 
     // delete node
     for i in 0..n {
