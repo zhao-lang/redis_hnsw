@@ -217,9 +217,17 @@ fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     // get index from global hashmap
     let mut indices = INDICES.write().unwrap();
-    indices
+    let index = indices
         .remove(&index_name)
         .ok_or_else(|| format!("Index: {} does not exist", name_suffix))?;
+    let index = match index.try_read() {
+        Ok(index) => index,
+        Err(e) => return Err(e.to_string().into()),
+    };
+
+    for (node_name, _) in index.nodes.iter() {
+        delete_node_redis(ctx, &node_name)?;
+    }
 
     Ok(1_usize.into())
 }
@@ -386,7 +394,6 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
         Err(e) => return Err(e.to_string().into()),
     };
 
-    // TODO return error if node has more than 1 strong_count
     let node = index.nodes.get(&node_name).unwrap();
     if Arc::strong_count(&node.0) > 1 {
         return Err(format!(
@@ -404,22 +411,28 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
         return Err(e.error_string().into());
     }
 
-    ctx.log_debug(format!("del key: {}", &node_name).as_str());
-    let rkey = ctx.open_key_writable(&node_name);
-    match rkey.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-        Some(_) => rkey.delete()?,
-        None => {
-            return Err(RedisError::String(format!(
-                "Node: {} does not exist",
-                &node_name
-            )));
-        }
-    };
+    delete_node_redis(ctx, &node_name)?;
 
     // update index in redis
     update_index(ctx, &index_name, &index)?;
 
     Ok(1_usize.into())
+}
+
+fn delete_node_redis(ctx: &Context, node_name: &str) -> Result<(), RedisError> {
+    ctx.log_debug(format!("del key: {}", node_name).as_str());
+    let rkey = ctx.open_key_writable(node_name);
+    match rkey.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
+        Some(_) => rkey.delete()?,
+        None => {
+            return Err(RedisError::String(format!(
+                "Node: {} does not exist",
+                node_name
+            )));
+        }
+    };
+
+    Ok(())
 }
 
 fn get_node(ctx: &Context, args: Vec<String>) -> RedisResult {
