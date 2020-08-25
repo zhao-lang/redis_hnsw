@@ -1,6 +1,6 @@
 [package]
 name = "redis_hnsw"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Zhao Lang <eltoshan@gmail.com>"]
 edition = "2018"
 
