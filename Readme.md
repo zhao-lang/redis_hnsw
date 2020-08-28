@@ -26,6 +26,8 @@
 ## Getting Started
 <a id="markdown-getting-started" name="getting-started"></a>
 
+> :warning: **requires nightly rust**
+
 Build the module - `cargo build`
 
 Load the module - `redis-server --loadmodule ./target/<build_mode>/libredis_hnsw.<dylib|so>`
