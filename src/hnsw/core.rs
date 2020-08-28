@@ -254,10 +254,7 @@ where
     R: Float,
 {
     fn new(sim: OrderedFloat<R>, node: Node<T>) -> Self {
-        let sp = _SimPair {
-            sim,
-            node,
-        };
+        let sp = _SimPair { sim, node };
         SimPair(Rc::new(RefCell::new(sp)))
     }
 
@@ -525,11 +522,11 @@ where
         let mut updated = HashSet::new();
         for lc in (0..(min(l_max, l) + 1)).rev() {
             w = self.search_level(data, &ep.upgrade(), self.ef_construction, lc);
-            let params = SelectParams{
-                m: self.m, 
+            let params = SelectParams {
+                m: self.m,
                 lc,
-                extend_candidates: true, 
-                keep_pruned_connections: true
+                extend_candidates: true,
+                keep_pruned_connections: true,
             };
             let mut neighbors = self.select_neighbors(query, &w, params, None);
             self.connect_neighbors(query, &neighbors, lc);
@@ -562,14 +559,13 @@ where
 
                 let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
                 if econn.len() > m_max {
-                    let params = SelectParams{
-                        m: m_max, 
+                    let params = SelectParams {
+                        m: m_max,
                         lc,
-                        extend_candidates: true, 
-                        keep_pruned_connections: true
+                        extend_candidates: true,
+                        keep_pruned_connections: true,
                     };
-                    let enewconn =
-                        self.select_neighbors(&er.node, &econn, params, None);
+                    let enewconn = self.select_neighbors(&er.node, &econn, params, None);
                     let up = self.update_node_connections(&er.node, &enewconn, &econn, lc, None);
                     for u in up {
                         updated.insert(u);
@@ -848,11 +844,11 @@ where
                 }
 
                 let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
-                let params = SelectParams{
-                    m: m_max, 
+                let params = SelectParams {
+                    m: m_max,
                     lc,
-                    extend_candidates: true, 
-                    keep_pruned_connections: true
+                    extend_candidates: true,
+                    keep_pruned_connections: true,
                 };
                 nnewconn = self.select_neighbors(&n, &nconn, params, Some(node));
             }

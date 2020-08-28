@@ -8,7 +8,7 @@ use std::convert::From;
 use std::os::raw::c_void;
 use std::{fmt, ptr};
 
-use super::hnsw::{Index, Node, SearchResult, metrics};
+use super::hnsw::{metrics, Index, Node, SearchResult};
 
 static INDEX_VERSION: i32 = 0;
 static NODE_VERSION: i32 = 0;
@@ -81,11 +81,7 @@ impl<T: Float, R: Float> From<Index<T, R>> for IndexRedis {
                         .collect::<Vec<String>>()
                 })
                 .collect(),
-            nodes: index
-                .nodes
-                .keys()
-                .cloned()
-                .collect::<Vec<String>>(),
+            nodes: index.nodes.keys().cloned().collect::<Vec<String>>(),
             enterpoint: match &index.enterpoint {
                 Some(ep) => Some(ep.upgrade().read().name.clone()),
                 None => None,
