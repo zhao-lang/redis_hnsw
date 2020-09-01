@@ -179,11 +179,7 @@ fn get_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     let index_name = format!("{}.{}", PREFIX, name_suffix);
 
     let index = load_index(ctx, &index_name)?;
-    let index = match index.try_read() {
-        Ok(index) => index,
-        Err(e) => return Err(e.to_string().into()),
-    };
-
+    let index = index.try_read().map_err(|e| e.to_string())?;
     ctx.log_debug(format!("Index: {:?}", index).as_str());
     ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
     ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
@@ -201,6 +197,18 @@ fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
     let index_name = format!("{}.{}", PREFIX, name_suffix);
 
+    // get index from global hashmap
+    load_index(ctx, &index_name)?;
+    let mut indices = INDICES.write().unwrap();
+    let index = indices
+        .remove(&index_name)
+        .ok_or_else(|| format!("Index: {} does not exist", name_suffix))?;
+    let index = index.try_read().map_err(|e| e.to_string())?;
+
+    for (node_name, _) in index.nodes.iter() {
+        delete_node_redis(ctx, &node_name)?;
+    }
+
     // get index from redis
     ctx.log_debug(format!("deleting index: {}", &index_name).as_str());
     let rkey = ctx.open_key_writable(&index_name);
@@ -214,20 +222,6 @@ fn delete_index(ctx: &Context, args: Vec<String>) -> RedisResult {
             )));
         }
     };
-
-    // get index from global hashmap
-    let mut indices = INDICES.write().unwrap();
-    let index = indices
-        .remove(&index_name)
-        .ok_or_else(|| format!("Index: {} does not exist", name_suffix))?;
-    let index = match index.try_read() {
-        Ok(index) => index,
-        Err(e) => return Err(e.to_string().into()),
-    };
-
-    for (node_name, _) in index.nodes.iter() {
-        delete_node_redis(ctx, &node_name)?;
-    }
 
     Ok(1_usize.into())
 }
@@ -243,10 +237,10 @@ fn load_index(ctx: &Context, index_name: &str) -> Result<IndexArc, RedisError> {
             ctx.log_debug(format!("get key: {}", &index_name).as_str());
             let rkey = ctx.open_key(&index_name);
 
-            let index_redis = match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
-                Some(index) => index,
-                None => return Err(format!("Index: {} does not exist", index_name).into()),
-            };
+            let index_redis = rkey
+                .get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)?
+                .ok_or_else(|| format!("Index: {} does not exist", index_name))?;
+
             let index = make_index(ctx, index_redis)?;
             v.insert(Arc::new(RwLock::new(index)))
         }
@@ -262,10 +256,10 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
     for node_name in &ir.nodes {
         let key = ctx.open_key(&node_name);
 
-        let nr = match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-            Some(n) => n,
-            None => return Err(format!("Node: {} does not exist", node_name).into()),
-        };
+        let nr = key
+            .get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)?
+            .ok_or_else(|| format!("Node: {} does not exist", node_name))?;
+
         let node = Node::new(node_name, &nr.data, index.m_max_0);
         index.nodes.insert(node_name.to_owned(), node);
     }
@@ -276,17 +270,16 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
 
         let key = ctx.open_key(&node_name);
 
-        let nr = match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-            Some(n) => n,
-            None => return Err(format!("Node: {} does not exist", node_name).into()),
-        };
+        let nr = key
+            .get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)?
+            .ok_or_else(|| format!("Node: {} does not exist", node_name))?;
         for layer in &nr.neighbors {
             let mut node_layer = Vec::with_capacity(layer.len());
             for neighbor in layer {
-                let nn = match index.nodes.get(neighbor) {
-                    Some(node) => node,
-                    None => return Err(format!("Node: {} does not exist", node_name).into()),
-                };
+                let nn = index
+                    .nodes
+                    .get(neighbor)
+                    .ok_or_else(|| format!("Node: {} does not exist", neighbor))?;
                 node_layer.push(nn.downgrade());
             }
             target.write().neighbors.push(node_layer);
@@ -297,10 +290,10 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
     for layer in &ir.layers {
         let mut node_layer = HashSet::with_capacity(layer.len());
         for node_name in layer {
-            let node = match index.nodes.get(node_name) {
-                Some(n) => n,
-                None => return Err(format!("Node: {} does not exist", node_name).into()),
-            };
+            let node = index
+                .nodes
+                .get(node_name)
+                .ok_or_else(|| format!("Node: {} does not exist", node_name))?;
             node_layer.insert(node.downgrade());
         }
         index.layers.push(node_layer);
@@ -309,10 +302,10 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
     // set enterpoint
     index.enterpoint = match &ir.enterpoint {
         Some(node_name) => {
-            let node = match index.nodes.get(node_name) {
-                Some(n) => n,
-                None => return Err(format!("Node: {} does not exist", node_name).into()),
-            };
+            let node = index
+                .nodes
+                .get(node_name)
+                .ok_or_else(|| format!("Node: {} does not exist", node_name))?;
             Some(node.downgrade())
         }
         None => None,
@@ -353,19 +346,16 @@ fn add_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let data = dataf64.iter().map(|d| *d as f32).collect::<Vec<f32>>();
 
     let index = load_index(ctx, &index_name)?;
-    let mut index = match index.try_write() {
-        Ok(index) => index,
-        Err(e) => return Err(e.to_string().into()),
-    };
+    let mut index = index.try_write().map_err(|e| e.to_string())?;
 
     let up = |name: String, node: Node<f32>| {
         write_node(ctx, &name, (&node).into()).unwrap();
     };
 
     ctx.log_debug(format!("Adding node: {} to Index: {}", &node_name, &index_name).as_str());
-    if let Err(e) = index.add_node(&node_name, &data, up) {
-        return Err(e.error_string().into());
-    }
+    index
+        .add_node(&node_name, &data, up)
+        .map_err(|e| e.error_string())?;
 
     // write node to redis
     let node = index.nodes.get(&node_name).unwrap();
@@ -389,10 +379,7 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
     let node_name = format!("{}.{}.{}", PREFIX, index_suffix, node_suffix);
 
     let index = load_index(ctx, &index_name)?;
-    let mut index = match index.try_write() {
-        Ok(index) => index,
-        Err(e) => return Err(e.to_string().into()),
-    };
+    let mut index = index.try_write().map_err(|e| e.to_string())?;
 
     let node = index.nodes.get(&node_name).unwrap();
     if Arc::strong_count(&node.0) > 1 {
@@ -407,9 +394,9 @@ fn delete_node(ctx: &Context, args: Vec<String>) -> RedisResult {
         write_node(ctx, &name, (&node).into()).unwrap();
     };
 
-    if let Err(e) = index.delete_node(&node_name, up) {
-        return Err(e.error_string().into());
-    }
+    index
+        .delete_node(&node_name, up)
+        .map_err(|e| e.error_string())?;
 
     delete_node_redis(ctx, &node_name)?;
 
@@ -449,17 +436,11 @@ fn get_node(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     let key = ctx.open_key(&node_name);
 
-    let value = match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-        Some(node) => node.into(),
-        None => {
-            return Err(RedisError::String(format!(
-                "Node: {} does not exist",
-                &node_name
-            )));
-        }
-    };
+    let value = key
+        .get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)?
+        .ok_or_else(|| format!("Node: {} does not exist", &node_name))?;
 
-    Ok(value)
+    Ok(value.into())
 }
 
 fn write_node<'a>(ctx: &'a Context, key: &str, node: NodeRedis) -> RedisResult {
@@ -490,10 +471,7 @@ fn search_knn(ctx: &Context, args: Vec<String>) -> RedisResult {
 
     let index_name = format!("{}.{}", PREFIX, index_suffix);
     let index = load_index(ctx, &index_name)?;
-    let index = match index.try_read() {
-        Ok(index) => index,
-        Err(e) => return Err(e.to_string().into()),
-    };
+    let index = index.try_read().map_err(|e| e.to_string())?;
 
     ctx.log_debug(
         format!(
