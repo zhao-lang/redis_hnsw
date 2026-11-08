@@ -1,5 +1,5 @@
 use crate::hnsw::core::*;
-use crate::hnsw::metrics::euclidean;
+use crate::hnsw::metrics::{MetricFuncs, euclidean, hamming};
 use std::sync::Arc;
 // use std::{thread, time};
 
@@ -9,7 +9,14 @@ fn hnsw_test() {
     let data_dim = 4;
 
     // index creation
-    let mut index: Index<f32, f32> = Index::new("foo", Box::new(euclidean), data_dim, 5, 16);
+    let mut index: Index<f32, f32> = Index::new(
+        "foo",
+        Box::new(euclidean),
+        MetricFuncs::Euclidean,
+        data_dim,
+        5,
+        16,
+    );
     assert_eq!(&index.name, "foo");
     assert_eq!(index.data_dim, data_dim);
     assert_eq!(index.m, 5);
@@ -134,7 +141,8 @@ fn hnsw_recall_vs_brute_force() {
     let (n, dim, k) = (2000, 16, 10);
     let data = lcg_data(n, dim, 42);
     let queries = lcg_data(100, dim, 7);
-    let mut index: Index<f32, f32> = Index::new("r", Box::new(euclidean), dim, 8, 64);
+    let mut index: Index<f32, f32> =
+        Index::new("r", Box::new(euclidean), MetricFuncs::Euclidean, dim, 8, 64);
     for (i, v) in data.iter().enumerate() {
         index.add_node(&format!("n{}", i), v, |_, _| {}).unwrap();
     }
@@ -203,9 +211,38 @@ fn hnsw_recall_vs_brute_force() {
 #[test]
 fn search_returns_k_even_when_k_exceeds_ef() {
     let data = lcg_data(300, 4, 3);
-    let mut index: Index<f32, f32> = Index::new("k", Box::new(euclidean), 4, 5, 10);
+    let mut index: Index<f32, f32> =
+        Index::new("k", Box::new(euclidean), MetricFuncs::Euclidean, 4, 5, 10);
     for (i, v) in data.iter().enumerate() {
         index.add_node(&format!("n{}", i), v, |_, _| {}).unwrap();
     }
     assert_eq!(index.search_knn(&data[0], 50).unwrap().len(), 50);
+}
+
+#[test]
+fn hamming_index_finds_nearest_bit_vectors() {
+    let dim = 32;
+    // Binary vectors from the bits of distinct seeds.
+    let data: Vec<Vec<f32>> = (0..500u64)
+        .map(|i| {
+            let bits = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+            (0..dim).map(|b| ((bits >> b) & 1) as f32).collect()
+        })
+        .collect();
+    let mut index: Index<f32, f32> =
+        Index::new("h", Box::new(hamming), MetricFuncs::Hamming, dim, 8, 64);
+    for (i, v) in data.iter().enumerate() {
+        index.add_node(&format!("n{}", i), v, |_, _| {}).unwrap();
+    }
+
+    // An indexed vector is its own nearest neighbor at distance 0.
+    let hits = index.search_knn(&data[7], 1).unwrap();
+    assert_eq!(hits[0].name, "n7");
+
+    // Flip one bit: the original is still nearest, at distance 1.
+    let mut q = data[7].clone();
+    q[3] = 1.0 - q[3];
+    let hits = index.search_knn(&q, 1).unwrap();
+    assert_eq!(hits[0].name, "n7");
+    assert_eq!(hamming(&q, &data[7], dim), -1.0);
 }

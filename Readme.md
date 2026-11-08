@@ -5,7 +5,7 @@
 # HNSW for Redis
 <a id="markdown-hnsw-for-redis" name="hnsw-for-redis"></a>
 
-`redis_hnsw` is a Hierarchical Navigable Small World (HNSW) implementation for Redis. Based on the paper [Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320). Currently only supports Euclidean distance, Hamming distance forthcoming.
+`redis_hnsw` is a Hierarchical Navigable Small World (HNSW) implementation for Redis. Based on the paper [Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320). Supports Euclidean and Hamming distance.
 
 <!-- TOC -->
 ## Table of Contents
@@ -35,7 +35,7 @@ Load the module - `redis-server --loadmodule ./target/<build_mode>/libredis_hnsw
 
 ### Redis commands
 <a id="markdown-redis-commands" name="redis-commands"></a>
-Creating a new index - `hnsw.new {index_name} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]`
+Creating a new index - `hnsw.new {index_name} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}] [METRIC {euclidean|hamming}]`
 
 Add nodes - `hnsw.node.add {index_name} {key} [DATA {dim} {...data}]`
 
@@ -45,6 +45,8 @@ Search KNN - `hnsw.search {index_name} [K {k}] [QUERY {dim} {...data}] [LOCAL]`
 
 Each node is an ordinary Redis key that you name. The HNSW graph is kept in memory and is not stored in keys. The module keeps it in step with the keyspace, so `DEL`, `EXPIRE`, eviction, `RENAME` and overwrites all update the index. The graph is rebuilt from the vectors when the server loads an RDB or AOF.
 
+> **Upgrading from 0.3:** 1.0 loads 0.3 data as Euclidean indexes, but 0.3 cannot load data written by 1.0. Upgrade every node in a cluster before migrating slots. `HNSW.GET` now reports the metric in lowercase (`euclidean`).
+>
 > **Upgrading from 0.2:** the on-disk format changed. 0.2 stored index and graph keys, and 0.3 cannot load them. Re-add your vectors after upgrading.
 
 ## Redis Cluster
@@ -96,19 +98,21 @@ cargo build && scripts/cluster.sh start 3 1 && python client/test_cluster.py; sc
 <a id="markdown-hnsw.new" name="hnsw.new"></a>
 #### Format
 ```
-HNSW.NEW {index} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]
+HNSW.NEW {index} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}] [METRIC {euclidean|hamming}]
 ```
 #### Description
 Creates an HNSW index on the receiving node. Repeating it with the same parameters is a no-op. In a cluster, send it to every primary.
 #### Example
 ```
 HNSW.NEW foo DIM 128 M 5 EFCON 200
+HNSW.NEW bits DIM 64 METRIC hamming
 ```
 #### Parameters
 * **index**: required, name of the new index.
 * **DIM**: required, dimensionality of the data.
 * **M**: optional, algorithm parameter for the number of neighbors to select for each node.
 * **EFCON**: optional, algorithm parameter for the size of the dynamic candidate list.
+* **METRIC**: optional, the distance metric. `euclidean` (default) is the squared Euclidean distance. `hamming` counts the entries where two vectors differ, for binary or categorical data. Search returns the negated distance as `similarity`.
 #### Complexity
 O(1)
 #### Returns

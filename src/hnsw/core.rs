@@ -288,6 +288,7 @@ impl<T: Float, R: Float> Index<T, R> {
     pub fn new(
         name: &str,
         mfunc: Box<metrics::MetricFuncT<T, R>>,
+        mfunc_kind: metrics::MetricFuncs,
         data_dim: usize,
         m: usize,
         ef_construction: usize,
@@ -295,7 +296,7 @@ impl<T: Float, R: Float> Index<T, R> {
         Index {
             name: name.to_string(),
             mfunc,
-            mfunc_kind: metrics::MetricFuncs::Euclidean,
+            mfunc_kind,
             data_dim,
             m,
             m_max: m,

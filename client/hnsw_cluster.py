@@ -70,9 +70,21 @@ class HnswCluster:
 
     # -- index ----------------------------------------------------------
 
-    def create_index(self, name: str, dim: int, m: int = 5, ef_construction: int = 200):
-        """Define the index on every primary. Safe to repeat, e.g. after adding a shard."""
-        self._on_primaries("HNSW.NEW", name, "DIM", dim, "M", m, "EFCON", ef_construction)
+    def create_index(
+        self,
+        name: str,
+        dim: int,
+        m: int = 5,
+        ef_construction: int = 200,
+        metric: str = "euclidean",
+    ):
+        """Define the index on every primary. Safe to repeat, e.g. after adding a shard.
+
+        ``metric`` is ``"euclidean"`` or ``"hamming"``.
+        """
+        self._on_primaries(
+            "HNSW.NEW", name, "DIM", dim, "M", m, "EFCON", ef_construction, "METRIC", metric
+        )
 
     def delete_index(self, name: str):
         """Drop the index and all of its nodes on every primary."""

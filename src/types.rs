@@ -1,3 +1,4 @@
+use crate::hnsw::metrics::MetricFuncs;
 use redis_module::native_types::RedisType;
 use redis_module::{RedisString, raw};
 
@@ -10,8 +11,9 @@ use std::ptr;
 /// v0 stored the graph's neighbor lists inside every node key, plus a separate
 /// index key. v1 stores only the vector and the parameters of the index it
 /// belongs to: the graph is a shard-local structure derived from the keys, so
-/// keys can move between cluster shards freely.
-const NODE_VERSION: i32 = 1;
+/// keys can move between cluster shards freely. v2 adds the index's distance
+/// metric to the parameters; v1 data loads as Euclidean.
+const NODE_VERSION: i32 = 2;
 
 /// The parameters that define an index. Every shard keeps its own copy, and
 /// every node carries one, so a shard that receives a node (slot migration,
@@ -21,6 +23,7 @@ pub struct IndexParams {
     pub dim: usize,
     pub m: usize,
     pub ef_construction: usize,
+    pub metric: MetricFuncs,
 }
 
 /// The value stored at a vector key.
@@ -84,18 +87,18 @@ unsafe extern "C" fn unlink_node(ctx: *mut raw::RedisModuleKeyOptCtx, value: *co
 }
 
 unsafe extern "C" fn load_node(rdb: *mut raw::RedisModuleIO, version: i32) -> *mut c_void {
-    if version != NODE_VERSION {
+    if !(1..=NODE_VERSION).contains(&version) {
         return ptr::null_mut();
     }
-    match read_node(rdb) {
+    match read_node(rdb, version) {
         Some(node) => Box::into_raw(Box::new(node)) as *mut c_void,
         None => ptr::null_mut(),
     }
 }
 
-fn read_node(rdb: *mut raw::RedisModuleIO) -> Option<NodeRedis> {
+fn read_node(rdb: *mut raw::RedisModuleIO, version: i32) -> Option<NodeRedis> {
     let index = load_str(rdb)?;
-    let params = load_params(rdb)?;
+    let params = load_params(rdb, version)?;
     let num_datum = load_usize(rdb)?;
     let data = (0..num_datum)
         .map(|_| raw::load_float(rdb).ok())
@@ -136,6 +139,8 @@ unsafe extern "C" fn rewrite_node(
         p.m.to_string(),
         "EFCON".into(),
         p.ef_construction.to_string(),
+        "METRIC".into(),
+        p.metric.name().into(),
     ];
     emit_aof(aof, "HNSW.NEW", &mut new_args);
 
@@ -181,7 +186,7 @@ unsafe extern "C" fn aux_save(rdb: *mut raw::RedisModuleIO, when: c_int) {
 }
 
 unsafe extern "C" fn aux_load(rdb: *mut raw::RedisModuleIO, encver: c_int, when: c_int) -> c_int {
-    if encver != NODE_VERSION {
+    if !(1..=NODE_VERSION).contains(&encver) {
         return raw::Status::Err as c_int;
     }
     if when != raw::Aux::Before as c_int {
@@ -190,7 +195,7 @@ unsafe extern "C" fn aux_load(rdb: *mut raw::RedisModuleIO, encver: c_int, when:
     let read = || -> Option<Vec<(String, IndexParams)>> {
         let n = load_usize(rdb)?;
         (0..n)
-            .map(|_| Some((load_str(rdb)?, load_params(rdb)?)))
+            .map(|_| Some((load_str(rdb)?, load_params(rdb, encver)?)))
             .collect()
     };
     match read() {
@@ -206,13 +211,23 @@ fn save_params(rdb: *mut raw::RedisModuleIO, p: &IndexParams) {
     raw::save_unsigned(rdb, p.dim as u64);
     raw::save_unsigned(rdb, p.m as u64);
     raw::save_unsigned(rdb, p.ef_construction as u64);
+    raw::save_unsigned(rdb, p.metric.code());
 }
 
-fn load_params(rdb: *mut raw::RedisModuleIO) -> Option<IndexParams> {
+fn load_params(rdb: *mut raw::RedisModuleIO, version: i32) -> Option<IndexParams> {
+    let dim = load_usize(rdb)?;
+    let m = load_usize(rdb)?;
+    let ef_construction = load_usize(rdb)?;
+    let metric = if version >= 2 {
+        MetricFuncs::from_code(raw::load_unsigned(rdb).ok()?)?
+    } else {
+        MetricFuncs::Euclidean
+    };
     Some(IndexParams {
-        dim: load_usize(rdb)?,
-        m: load_usize(rdb)?,
-        ef_construction: load_usize(rdb)?,
+        dim,
+        m,
+        ef_construction,
+        metric,
     })
 }
 

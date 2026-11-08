@@ -62,7 +62,8 @@ fn indices() -> Result<MutexGuard<'static, HashMap<String, IndexT>>, RedisError>
 fn new_graph(name: &str, p: &IndexParams) -> IndexT {
     Index::new(
         name,
-        Box::new(hnsw::metrics::euclidean),
+        Box::new(p.metric.func()),
+        p.metric,
         p.dim,
         p.m,
         p.ef_construction,
@@ -74,6 +75,7 @@ fn params_of(index: &IndexT) -> IndexParams {
         dim: index.data_dim,
         m: index.m,
         ef_construction: index.ef_construction,
+        metric: index.mfunc_kind,
     }
 }
 
@@ -235,6 +237,11 @@ thread_local! {
                 "Parameter for the size of the dynamic candidate list.",
                 ArgType::Kwarg, u64, Collection::Unit, Some(Box::new(200_u64))
             ],
+            [
+                "metric",
+                "Distance metric: `euclidean` (squared Euclidean) or `hamming` (number of differing entries).",
+                ArgType::Kwarg, String, Collection::Unit, Some(Box::new("euclidean".to_owned()))
+            ],
         ],
     };
 
@@ -323,10 +330,14 @@ fn new_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut parsed = NEW_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let name = parsed.remove("name").unwrap().as_string()?;
+    let metric_name = parsed.remove("metric").unwrap().as_string()?;
+    let metric = hnsw::metrics::MetricFuncs::parse(&metric_name)
+        .ok_or_else(|| err(format!("Unknown METRIC: {metric_name}")))?;
     let params = IndexParams {
         dim: parsed.remove("dim").unwrap().as_u64()? as usize,
         m: parsed.remove("m").unwrap().as_u64()? as usize,
         ef_construction: parsed.remove("efcon").unwrap().as_u64()? as usize,
+        metric,
     };
     if params.dim == 0 {
         return Err(RedisError::Str("DIM must be at least 1"));
@@ -369,7 +380,7 @@ fn get_index(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
         "name".into(),
         index.name.as_str().into(),
         "metric".into(),
-        format!("{:?}", index.mfunc_kind).into(),
+        index.mfunc_kind.name().into(),
         "data_dim".into(),
         index.data_dim.into(),
         "m".into(),

@@ -4,9 +4,55 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-#[derive(Copy, Clone, Debug)]
+/// Distance metrics an index can use. Every metric returns a similarity: the
+/// negated distance, so larger is closer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MetricFuncs {
+    /// Negated squared Euclidean distance.
     Euclidean,
+    /// Negated count of positions where the vectors differ.
+    Hamming,
+}
+
+impl MetricFuncs {
+    pub fn func(self) -> MetricFuncT<f32, f32> {
+        match self {
+            MetricFuncs::Euclidean => euclidean,
+            MetricFuncs::Hamming => hamming,
+        }
+    }
+
+    /// Name used in commands (`METRIC`) and replies.
+    pub fn name(self) -> &'static str {
+        match self {
+            MetricFuncs::Euclidean => "euclidean",
+            MetricFuncs::Hamming => "hamming",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "euclidean" => Some(MetricFuncs::Euclidean),
+            "hamming" => Some(MetricFuncs::Hamming),
+            _ => None,
+        }
+    }
+
+    /// Stable code for persistence. Never reuse or renumber a code.
+    pub fn code(self) -> u64 {
+        match self {
+            MetricFuncs::Euclidean => 0,
+            MetricFuncs::Hamming => 1,
+        }
+    }
+
+    pub fn from_code(code: u64) -> Option<Self> {
+        match code {
+            0 => Some(MetricFuncs::Euclidean),
+            1 => Some(MetricFuncs::Hamming),
+            _ => None,
+        }
+    }
 }
 
 pub type MetricFuncT<T, R> = fn(&[T], &[T], usize) -> R;
@@ -23,6 +69,13 @@ pub fn euclidean(v1: &[f32], v2: &[f32], n: usize) -> f32 {
         }
     }
     sim_func_euc(v1, v2, n)
+}
+
+/// Negated Hamming distance: the number of positions where `v1` and `v2`
+/// differ. Meant for binary or categorical vectors; any two unequal floats
+/// count as one difference.
+pub fn hamming(v1: &[f32], v2: &[f32], _n: usize) -> f32 {
+    -(v1.iter().zip(v2).filter(|(a, b)| a != b).count() as f32)
 }
 
 fn hsum_ps_sse3(v: __m128) -> f32 {
