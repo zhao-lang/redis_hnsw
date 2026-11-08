@@ -239,7 +239,7 @@ thread_local! {
             ],
             [
                 "metric",
-                "Distance metric: `euclidean` (squared Euclidean) or `hamming` (number of differing entries).",
+                "Distance metric: `euclidean` (squared Euclidean), `hamming` (number of differing entries) or `cosine` (1 - cosine similarity).",
                 ArgType::Kwarg, String, Collection::Unit, Some(Box::new("euclidean".to_owned()))
             ],
         ],

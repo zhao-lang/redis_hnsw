@@ -12,6 +12,8 @@ pub enum MetricFuncs {
     Euclidean,
     /// Negated count of positions where the vectors differ.
     Hamming,
+    /// Negated cosine distance, `1 - cos(angle)`, in [-2, 0].
+    Cosine,
 }
 
 impl MetricFuncs {
@@ -19,6 +21,7 @@ impl MetricFuncs {
         match self {
             MetricFuncs::Euclidean => euclidean,
             MetricFuncs::Hamming => hamming,
+            MetricFuncs::Cosine => cosine,
         }
     }
 
@@ -27,6 +30,7 @@ impl MetricFuncs {
         match self {
             MetricFuncs::Euclidean => "euclidean",
             MetricFuncs::Hamming => "hamming",
+            MetricFuncs::Cosine => "cosine",
         }
     }
 
@@ -34,6 +38,7 @@ impl MetricFuncs {
         match s.to_ascii_lowercase().as_str() {
             "euclidean" => Some(MetricFuncs::Euclidean),
             "hamming" => Some(MetricFuncs::Hamming),
+            "cosine" => Some(MetricFuncs::Cosine),
             _ => None,
         }
     }
@@ -43,6 +48,7 @@ impl MetricFuncs {
         match self {
             MetricFuncs::Euclidean => 0,
             MetricFuncs::Hamming => 1,
+            MetricFuncs::Cosine => 2,
         }
     }
 
@@ -50,6 +56,7 @@ impl MetricFuncs {
         match code {
             0 => Some(MetricFuncs::Euclidean),
             1 => Some(MetricFuncs::Hamming),
+            2 => Some(MetricFuncs::Cosine),
             _ => None,
         }
     }
@@ -76,6 +83,26 @@ pub fn euclidean(v1: &[f32], v2: &[f32], n: usize) -> f32 {
 /// count as one difference.
 pub fn hamming(v1: &[f32], v2: &[f32], _n: usize) -> f32 {
     -(v1.iter().zip(v2).filter(|(a, b)| a != b).count() as f32)
+}
+
+/// Negated cosine distance: `cos(angle) - 1`, from 0 (same direction) to -2
+/// (opposite). Magnitude is ignored. A zero vector has no direction, so its
+/// distance to anything is 1, as if orthogonal.
+pub fn cosine(v1: &[f32], v2: &[f32], _n: usize) -> f32 {
+    // Accumulate in f64: squared norms of large vectors lose precision in f32.
+    let (mut dot, mut n1, mut n2) = (0.0f64, 0.0f64, 0.0f64);
+    for (&a, &b) in v1.iter().zip(v2) {
+        let (a, b) = (a as f64, b as f64);
+        dot += a * b;
+        n1 += a * a;
+        n2 += b * b;
+    }
+    if n1 == 0.0 || n2 == 0.0 {
+        return -1.0;
+    }
+    // Rounding can push |cos| just past 1.
+    let cos = (dot / (n1.sqrt() * n2.sqrt())).clamp(-1.0, 1.0);
+    (cos - 1.0) as f32
 }
 
 fn hsum_ps_sse3(v: __m128) -> f32 {

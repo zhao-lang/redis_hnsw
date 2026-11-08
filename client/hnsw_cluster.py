@@ -80,7 +80,7 @@ class HnswCluster:
     ):
         """Define the index on every primary. Safe to repeat, e.g. after adding a shard.
 
-        ``metric`` is ``"euclidean"`` or ``"hamming"``.
+        ``metric`` is ``"euclidean"``, ``"hamming"`` or ``"cosine"``.
         """
         self._on_primaries(
             "HNSW.NEW", name, "DIM", dim, "M", m, "EFCON", ef_construction, "METRIC", metric

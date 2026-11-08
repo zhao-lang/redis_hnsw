@@ -1,5 +1,5 @@
 use crate::hnsw::core::*;
-use crate::hnsw::metrics::{MetricFuncs, euclidean, hamming};
+use crate::hnsw::metrics::{MetricFuncs, cosine, euclidean, hamming};
 use std::sync::Arc;
 // use std::{thread, time};
 
@@ -245,4 +245,21 @@ fn hamming_index_finds_nearest_bit_vectors() {
     let hits = index.search_knn(&q, 1).unwrap();
     assert_eq!(hits[0].name, "n7");
     assert_eq!(hamming(&q, &data[7], dim), -1.0);
+}
+
+#[test]
+fn cosine_index_ignores_magnitude() {
+    let data = lcg_data(500, 8, 11);
+    let mut index: Index<f32, f32> =
+        Index::new("c", Box::new(cosine), MetricFuncs::Cosine, 8, 8, 64);
+    for (i, v) in data.iter().enumerate() {
+        index.add_node(&format!("n{}", i), v, |_, _| {}).unwrap();
+    }
+
+    // A scaled copy of an indexed vector points the same way, so that vector
+    // is nearest at distance ~0.
+    let q: Vec<f32> = data[42].iter().map(|x| x * 100.0).collect();
+    let hits = index.search_knn(&q, 1).unwrap();
+    assert_eq!(hits[0].name, "n42");
+    assert!(cosine(&q, &data[42], 8).abs() < 1e-6);
 }
