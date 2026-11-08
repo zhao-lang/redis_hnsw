@@ -4,6 +4,13 @@ version = "0.3.0"
 authors = ["Zhao Lang <eltoshan@gmail.com>"]
 edition = "2024"
 rust-version = "1.88"
+description = "Redis module for HNSW approximate nearest neighbor search, with Redis Cluster support"
+license = "MIT"
+repository = "https://github.com/zhao-lang/redis_hnsw"
+readme = "Readme.md"
+keywords = ["redis", "hnsw", "vector-search", "nearest-neighbor", "redis-module"]
+categories = ["database-implementations", "algorithms"]
+exclude = [".github"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -12,8 +19,14 @@ crate-type=["cdylib"]
 
 [dependencies]
 redis-module = "2"
-redismodule_cmd = { version = "0.2.0", features = ["docgen"] }
+redismodule_cmd = "0.2.0"
 rand = "0.10"
 ordered-float = "5"
 num-traits = "0.2"
+
+[features]
+# Write doc/COMMAND_REFERENCE_GEN.md from the command definitions at build
+# time. Off by default: it writes into the source tree, which crates.io
+# packages must not do.
+docgen = ["redismodule_cmd/docgen"]
 

@@ -28,7 +28,9 @@ use redis_module::{
     Context, ContextFlags, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status,
     ThreadSafeContext, logging, raw, redis_module,
 };
-use redismodule_cmd::{ArgType, Collection, Command, command, rediscmd_doc};
+#[cfg(feature = "docgen")]
+use redismodule_cmd::rediscmd_doc;
+use redismodule_cmd::{ArgType, Collection, Command, command};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{LazyLock, Mutex, MutexGuard, TryLockError};
@@ -216,7 +218,7 @@ fn init(ctx: &Context, _args: &[RedisString]) -> Status {
 }
 
 thread_local! {
-    #[rediscmd_doc(clean)]
+    #[cfg_attr(feature = "docgen", rediscmd_doc(clean))]
     static NEW_INDEX_CMD: Command = command!{
         name: "hnsw.new",
         desc: "Create an HNSW index on this shard. Idempotent when the parameters match. In a cluster, send it to every primary.",
@@ -236,7 +238,7 @@ thread_local! {
         ],
     };
 
-    #[rediscmd_doc]
+    #[cfg_attr(feature = "docgen", rediscmd_doc)]
     static GET_INDEX_CMD: Command = command!{
         name: "hnsw.get",
         desc: "Retrieve an HNSW index as seen by this shard (node_count is local).",
@@ -245,7 +247,7 @@ thread_local! {
         ],
     };
 
-    #[rediscmd_doc]
+    #[cfg_attr(feature = "docgen", rediscmd_doc)]
     static DEL_INDEX_CMD: Command = command!{
         name: "hnsw.del",
         desc: "Delete an HNSW index and its nodes on this shard. In a cluster, send it to every primary.",
@@ -254,7 +256,7 @@ thread_local! {
         ],
     };
 
-    #[rediscmd_doc]
+    #[cfg_attr(feature = "docgen", rediscmd_doc)]
     static ADD_NODE_CMD: Command = command!{
         name: "hnsw.node.add",
         desc: "Add a node to the index, or replace it. The node is stored at `key`.",
@@ -269,7 +271,7 @@ thread_local! {
         ],
     };
 
-    #[rediscmd_doc]
+    #[cfg_attr(feature = "docgen", rediscmd_doc)]
     static GET_NODE_CMD: Command = command!{
         name: "hnsw.node.get",
         desc: "Retrieve a node from the index.",
@@ -279,7 +281,7 @@ thread_local! {
         ],
     };
 
-    #[rediscmd_doc]
+    #[cfg_attr(feature = "docgen", rediscmd_doc)]
     static DEL_NODE_CMD: Command = command!{
         name: "hnsw.node.del",
         desc: "Delete a node from the index. Plain DEL on the key works too.",
@@ -289,7 +291,7 @@ thread_local! {
         ],
     };
 
-    #[rediscmd_doc]
+    #[cfg_attr(feature = "docgen", rediscmd_doc)]
     static SEARCH_CMD: Command = command!{
         name: "hnsw.search",
         desc: "Search the index for the K nearest elements to the query. In a cluster the receiving node searches every shard; add LOCAL to search only the receiving node's part.",
