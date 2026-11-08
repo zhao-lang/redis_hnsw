@@ -4,7 +4,9 @@ Each shard holds an HNSW graph over the vectors stored on it. This client:
 
 * sends index-level commands (HNSW.NEW / HNSW.DEL) to every primary,
 * lets the cluster route node commands by key, like any other key command,
-* fans HNSW.SEARCH out to every primary and merges the per-shard top-k.
+* searches either through the module's own coordinator (one HNSW.SEARCH
+  to any node) or by fanning ``HNSW.SEARCH ... LOCAL`` out to every primary
+  and merging the per-shard top-k here.
 
 Requires redis-py >= 5 (``pip install redis``).
 
@@ -20,6 +22,7 @@ from redis.exceptions import AskError, MovedError
 
 from __future__ import annotations
 
+import random
 from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence
 
@@ -100,22 +103,38 @@ class HnswCluster:
 
     # -- search ---------------------------------------------------------
 
-    def search(self, index: str, query: Sequence[float], k: int = 5) -> list[tuple[str, float]]:
+    def search(
+        self, index: str, query: Sequence[float], k: int = 5, fanout: str = "server"
+    ) -> list[tuple[str, float]]:
         """K nearest neighbours across the cluster, as (key, similarity) pairs.
 
-        Each shard returns its own top-k, so the global top-k is among their
-        union. A key seen twice (mid-migration) is counted once.
+        ``fanout="server"`` sends one HNSW.SEARCH to a random primary, which
+        coordinates the search in the module. ``fanout="client"`` sends
+        ``HNSW.SEARCH ... LOCAL`` to every primary and merges here.
         """
-        replies = self._on_primaries("HNSW.SEARCH", index, "K", k, "QUERY", len(query), *query)
+        args = ("HNSW.SEARCH", index, "K", k, "QUERY", len(query), *query)
+        if fanout == "server":
+            node = random.choice(self.rc.get_primaries())
+            return _hits(self.rc.execute_command(*args, target_nodes=node))
+        if fanout != "client":
+            raise ValueError(f"fanout must be 'server' or 'client', not {fanout!r}")
+
+        # Each shard returns its own top-k, so the global top-k is among their
+        # union. A key seen twice (mid-migration) is counted once.
         best: dict[str, float] = {}
-        for reply in replies:
-            for item in reply[1:]:
-                fields = dict(zip(item[::2], item[1::2]))
-                name = _str(fields[_key(fields, "name")])
-                sim = float(fields[_key(fields, "similarity")])
+        for reply in self._on_primaries(*args, "LOCAL"):
+            for name, sim in _hits(reply):
                 if sim > best.get(name, float("-inf")):
                     best[name] = sim
         return sorted(best.items(), key=lambda kv: kv[1], reverse=True)[:k]
+
+
+def _hits(reply) -> list[tuple[str, float]]:
+    hits = []
+    for item in reply[1:]:
+        fields = dict(zip(item[::2], item[1::2]))
+        hits.append((_str(fields[_key(fields, "name")]), float(fields[_key(fields, "similarity")])))
+    return hits
 
 
 def _str(v) -> str:

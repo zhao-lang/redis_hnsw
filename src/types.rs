@@ -1,11 +1,9 @@
 use redis_module::native_types::RedisType;
-use redis_module::{RedisString, RedisValue, raw};
+use redis_module::{RedisString, raw};
 
 use std::ffi::CString;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-
-use super::hnsw::SearchResult;
 
 /// Encoding version of the node type.
 ///
@@ -225,31 +223,4 @@ fn load_usize(rdb: *mut raw::RedisModuleIO) -> Option<usize> {
 fn load_str(rdb: *mut raw::RedisModuleIO) -> Option<String> {
     let s = raw::load_string(rdb).ok()?;
     s.try_as_str().ok().map(str::to_owned)
-}
-
-#[derive(Default)]
-pub struct SearchResultRedis {
-    pub sim: f64,
-    pub name: String,
-}
-
-impl From<&SearchResult<f32, f32>> for SearchResultRedis {
-    fn from(res: &SearchResult<f32, f32>) -> Self {
-        SearchResultRedis {
-            sim: res.sim.into_inner() as f64,
-            name: res.name.clone(),
-        }
-    }
-}
-
-impl From<SearchResultRedis> for RedisValue {
-    fn from(sr: SearchResultRedis) -> Self {
-        let reply: Vec<RedisValue> = vec![
-            "similarity".into(),
-            sr.sim.into(),
-            "name".into(),
-            sr.name.as_str().into(),
-        ];
-        reply.into()
-    }
 }

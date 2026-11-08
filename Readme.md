@@ -41,7 +41,7 @@ Add nodes - `hnsw.node.add {index_name} {key} [DATA {dim} {...data}]`
 
 Delete nodes - `hnsw.node.del {index_name} {key}` (or plain `DEL {key}`)
 
-Search KNN - `hnsw.search {index_name} [K {k}] [QUERY {dim} {...data}]`
+Search KNN - `hnsw.search {index_name} [K {k}] [QUERY {dim} {...data}] [LOCAL]`
 
 Each node is an ordinary Redis key that you name. The HNSW graph is kept in memory and is not stored in keys. The module keeps it in step with the keyspace, so `DEL`, `EXPIRE`, eviction, `RENAME` and overwrites all update the index. The graph is rebuilt from the vectors when the server loads an RDB or AOF.
 
@@ -53,11 +53,17 @@ Each node is an ordinary Redis key that you name. The HNSW graph is kept in memo
 Every shard keeps its own HNSW graph over the vectors it stores. A cluster-wide search sends the query to every primary and merges the per-shard top-k results.
 
 * **Node commands are routed by key.** `HNSW.NODE.ADD/GET/DEL` declare `{key}` as their key, so the cluster sends them to the shard that owns it. Vectors spread across shards like any other keys. Use a hash tag in the key (`doc:{42}:vec`) to keep a vector next to related data.
-* **Index commands are per shard.** `HNSW.NEW`, `HNSW.DEL`, `HNSW.GET` and `HNSW.SEARCH` are keyless and act only on the node that receives them. Send `HNSW.NEW` and `HNSW.DEL` to every primary. `HNSW.NEW` is idempotent when the parameters match, so you can re-send it after adding a shard. Each node also carries its index's parameters, so a shard that receives vectors through slot migration defines the index by itself.
-* **Search fans out.** Send `HNSW.SEARCH` to every primary, or to replicas after `READONLY`. Merge the results by similarity and keep the top K. A key can briefly appear on two shards during a migration, so dedupe by name.
+* **Index commands are per shard.** `HNSW.NEW`, `HNSW.DEL` and `HNSW.GET` are keyless and act only on the node that receives them. Send `HNSW.NEW` and `HNSW.DEL` to every primary. `HNSW.NEW` is idempotent when the parameters match, so you can re-send it after adding a shard. Each node also carries its index's parameters, so a shard that receives vectors through slot migration defines the index by itself.
+* **Search is coordinated by the node that receives it.** Send `HNSW.SEARCH` to any node: a primary, or a replica after `READONLY`. That node searches its own graph, then sends `HNSW.SEARCH ... LOCAL` in parallel to the primary of every other shard. It merges the per-shard top-k results, counts a key that appears on two shards mid-migration only once, and replies with the global top K. The client stays unblocked server-side while the shards answer, so the node keeps serving other commands.
+  * The coordinator connects to the other nodes on their client port. If `masterauth` is set, it authenticates with `masteruser`/`masterauth`. TLS is not supported.
+  * Each shard gets a 5s timeout. A shard that is down or slow fails the search with an error naming that shard. Give your client a longer socket timeout than that, so it doesn't time out first and retry the search.
+  * Inside `MULTI` or a script, the command can't block. Add `LOCAL` there.
+* **`LOCAL` searches one shard.** It searches only the receiving node's graph. You can use it to fan out from the client instead of the server.
+
+[doc/CLUSTER.md](doc/CLUSTER.md) explains step by step how the in-module coordinator works, and compares it with fanning out from the client.
 * **Slot migration, replication and persistence need nothing extra.** `MIGRATE` removes nodes from the source graph and adds them to the target graph. Replicas build their own graphs from the replication stream. Index definitions are saved in the RDB, so they survive restarts even when a shard holds no nodes.
 
-[`client/hnsw_cluster.py`](client/hnsw_cluster.py) is a reference coordinator built on redis-py. It broadcasts index commands, routes node commands, and runs the fan-out search:
+[`client/hnsw_cluster.py`](client/hnsw_cluster.py) is a reference client built on redis-py. It broadcasts index commands and routes node commands. It searches through the server-side coordinator by default, or with `fanout="client"` it merges `LOCAL` searches itself:
 
 ```python
 from redis.cluster import RedisCluster
@@ -67,9 +73,10 @@ hc = HnswCluster(RedisCluster(host="127.0.0.1", port=7000))
 hc.create_index("docs", dim=3)
 hc.add("docs", "doc:1:vec", [0.1, 0.2, 0.3])
 hc.search("docs", [0.1, 0.2, 0.3], k=5)   # [("doc:1:vec", -0.0), ...]
+hc.search("docs", [0.1, 0.2, 0.3], k=5, fanout="client")
 ```
 
-To run the end-to-end test against a local 3-primary, 3-replica cluster:
+To run the end-to-end test against a local 3-primary, 3-replica cluster (set `PASSWORD` and `REDIS_PASSWORD` to run it with authentication):
 
 ```bash
 cargo build && scripts/cluster.sh start 3 1 && python client/test_cluster.py; scripts/cluster.sh stop
@@ -210,10 +217,10 @@ OK or an error
 <a id="markdown-hnsw.search" name="hnsw.search"></a>
 #### Format
 ```
-HNSW.SEARCH {index} [K {k}] [QUERY {dim} {...data}]
+HNSW.SEARCH {index} [K {k}] [QUERY {dim} {...data}] [LOCAL]
 ```
 #### Description
-Searches the receiving node's part of the index for the K nearest elements to the query. In a cluster, send it to every primary and merge the results (see [Redis Cluster](#redis-cluster)).
+Searches the index for the K nearest elements to the query. In a cluster, the receiving node searches every shard and merges the results (see [Redis Cluster](#redis-cluster)). With `LOCAL`, it searches only the receiving node's graph.
 #### Example
 ```
 HNSW.SEARCH foo K 5 QUERY 4 0.0 0.0 0.0 0.0
@@ -222,6 +229,7 @@ HNSW.SEARCH foo K 5 QUERY 4 0.0 0.0 0.0 0.0
 * **index**: required, name of the index
 * **K**: required, number of nearest neighbors to return
 * **QUERY**: required, dimensionality followed by space separated vector of query data. Total entries must match `DIM` of index
+* **LOCAL**: optional, search only the receiving node's part of the index
 #### Complexity
 O(log(n)) where n is the number of nodes in the index
 #### Returns

@@ -9,18 +9,24 @@
 //! RESTORE from slot migration, RDB load) and the type's unlink callback (DEL,
 //! expiry, eviction, overwrite, MIGRATE away), and it is never stored in keys.
 //!
-//! `HNSW.SEARCH` searches the local graph only. To search a whole cluster, send
-//! it to every primary and merge the top-k (see `client/hnsw_cluster.py`).
-//! Index definitions (`HNSW.NEW` / `HNSW.DEL`) are per shard and must be sent
-//! to every primary too.
+//! `HNSW.SEARCH` sent to any node searches the whole cluster: the node
+//! coordinates a fan-out to the other shards (see `coordinator`). With `LOCAL`
+//! it searches only the receiving node's graph, which is what the coordinator
+//! sends to each shard, and what a client-side coordinator can use instead
+//! (see `client/hnsw_cluster.py`). Index definitions (`HNSW.NEW` / `HNSW.DEL`)
+//! are per shard and must be sent to every primary.
 
+mod coordinator;
+#[cfg(test)]
+mod coordinator_tests;
 mod hnsw;
 mod types;
 
+use coordinator::Hit;
 use hnsw::Index;
 use redis_module::{
-    Context, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status, logging, raw,
-    redis_module,
+    Context, ContextFlags, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status,
+    ThreadSafeContext, logging, raw, redis_module,
 };
 use redismodule_cmd::{ArgType, Collection, Command, command, rediscmd_doc};
 use std::collections::HashMap;
@@ -286,7 +292,7 @@ thread_local! {
     #[rediscmd_doc]
     static SEARCH_CMD: Command = command!{
         name: "hnsw.search",
-        desc: "Search this shard's part of the index for the K nearest elements to the query. In a cluster, send it to every primary and merge the results.",
+        desc: "Search the index for the K nearest elements to the query. In a cluster the receiving node searches every shard; add LOCAL to search only the receiving node's part.",
         args: [
             ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
             [
@@ -514,7 +520,18 @@ fn delete_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     Ok(1_usize.into())
 }
 
-fn search_knn(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+fn search_knn(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+    // LOCAL is a bare flag, which the argument parser has no type for. Only
+    // look past the index name (argv[1]), which may itself be "local".
+    let local_at = args
+        .iter()
+        .skip(2)
+        .position(|a| a.as_slice().eq_ignore_ascii_case(b"LOCAL"))
+        .map(|i| i + 2);
+    let mut args = args;
+    let local = local_at.map(|i| args.remove(i)).is_some();
+    let raw_args: Vec<Vec<u8>> = args.iter().map(|a| a.as_slice().to_vec()).collect();
+
     let mut parsed = SEARCH_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let index = parsed.remove("index").unwrap().as_string()?;
@@ -527,19 +544,65 @@ fn search_knn(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
         .map(|d| *d as f32)
         .collect::<Vec<f32>>();
 
-    let indices = indices()?;
-    let graph = indices.get(&index).ok_or_else(|| no_index(&index))?;
-    let res = graph
-        .search_knn(&data, k)
-        .map_err(|e| err(e.error_string()))?;
+    // The graph is only touched on the main thread, so search it here.
+    let hits: Vec<Hit> = {
+        let indices = indices()?;
+        let graph = indices.get(&index).ok_or_else(|| no_index(&index))?;
+        graph
+            .search_knn(&data, k)
+            .map_err(|e| err(e.error_string()))?
+            .iter()
+            .map(|r| Hit {
+                sim: r.sim.into_inner() as f64,
+                name: r.name.clone(),
+            })
+            .collect()
+    };
 
-    let mut reply: Vec<RedisValue> = Vec::with_capacity(res.len() + 1);
-    reply.push(res.len().into());
-    for r in &res {
-        let sr: SearchResultRedis = r.into();
-        reply.push(sr.into());
+    let flags = ctx.get_flags();
+    if local || !flags.contains(ContextFlags::CLUSTER) {
+        return Ok(coordinator::reply(&hits));
     }
-    Ok(reply.into())
+    let remotes = coordinator::remote_primaries(ctx)?;
+    if remotes.is_empty() {
+        return Ok(coordinator::reply(&hits));
+    }
+    if flags.contains(ContextFlags::DENY_BLOCKING) {
+        return Err(RedisError::Str(
+            "a cluster-wide HNSW.SEARCH cannot run inside MULTI or a script; add LOCAL",
+        ));
+    }
+
+    let auth = coordinator::read_auth(ctx);
+    let mut shard_args = raw_args;
+    shard_args.push(b"LOCAL".to_vec());
+
+    let blocked = ctx.block_client();
+    std::thread::spawn(move || {
+        let (auth, shard_args) = (&auth, &shard_args);
+        let results: Vec<Result<Vec<Hit>, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = remotes
+                .iter()
+                .map(|&addr| s.spawn(move || coordinator::search_remote(addr, auth, shard_args)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("shard search panicked".into()))
+                })
+                .collect()
+        });
+        let reply = results
+            .into_iter()
+            .collect::<Result<Vec<_>, String>>()
+            .map(|lists| {
+                coordinator::reply(&coordinator::merge(lists.into_iter().chain([hits]), k))
+            })
+            .map_err(|e| err(format!("HNSW.SEARCH failed on shard {e}")));
+        ThreadSafeContext::with_blocked_client(blocked).reply(reply);
+    });
+    Ok(RedisValue::NoReply)
 }
 
 // The Redis allocator only exists inside a running Redis server, so unit tests

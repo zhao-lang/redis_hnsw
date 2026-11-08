@@ -4,24 +4,40 @@
     scripts/cluster.sh start 3 1
     python client/test_cluster.py
     scripts/cluster.sh stop
+
+Set REDIS_PASSWORD (for both commands) to run against a cluster that requires
+a password; the module's coordinator then authenticates with masterauth.
 """
 
 from __future__ import annotations
 
+import os
 import random
+import socket
 import subprocess
+import threading
 import time
 
 from redis import Redis
 from redis.cluster import RedisCluster
 from redis.exceptions import ResponseError
 
-from hnsw_cluster import HnswCluster
+from hnsw_cluster import HnswCluster, _hits as hc_hits
 
 DIM = 8
 N = 400
 K = 10
 INDEX = "test"
+PASSWORD = os.environ.get("REDIS_PASSWORD") or None
+CLI = ["redis-cli"] + (["-a", PASSWORD, "--no-auth-warning"] if PASSWORD else [])
+
+
+def R(port: int) -> Redis:
+    return Redis(port=port, password=PASSWORD)
+
+
+def RC() -> RedisCluster:
+    return RedisCluster(host="127.0.0.1", port=7000, password=PASSWORD)
 
 
 def brute_force(vectors: dict[str, list[float]], q: list[float], k: int) -> list[str]:
@@ -29,10 +45,10 @@ def brute_force(vectors: dict[str, list[float]], q: list[float], k: int) -> list
     return sorted(dist, key=dist.get)[:k]
 
 
-def recall(hc: HnswCluster, vectors, queries) -> float:
+def recall(hc: HnswCluster, vectors, queries, fanout: str = "server") -> float:
     hits = 0
     for q in queries:
-        got = {key for key, _ in hc.search(INDEX, q, K)}
+        got = {key for key, _ in hc.search(INDEX, q, K, fanout=fanout)}
         hits += len(got & set(brute_force(vectors, q, K)))
     return hits / (K * len(queries))
 
@@ -55,12 +71,12 @@ def shard_consistent(rc: RedisCluster, hc: HnswCluster) -> bool:
 
 
 def node_id(port: int) -> str:
-    return Redis(port=port).execute_command("CLUSTER", "MYID").decode()
+    return R(port).execute_command("CLUSTER", "MYID").decode()
 
 
 def main():
     rng = random.Random(42)
-    rc = RedisCluster(host="127.0.0.1", port=7000)
+    rc = RC()
     hc = HnswCluster(rc)
     rc.flushall(target_nodes=RedisCluster.PRIMARIES)
 
@@ -78,9 +94,27 @@ def main():
     assert all(c > 0 for c in counts.values()), "keys should spread over shards"
     assert shard_consistent(rc, hc)
 
-    r = recall(hc, vectors, queries)
-    print(f"recall@{K}: {r:.3f}")
-    assert r >= 0.95
+    for fanout in ("server", "client"):
+        r = recall(hc, vectors, queries, fanout)
+        print(f"recall@{K} ({fanout} fan-out): {r:.3f}")
+        assert r >= 0.95
+
+    # in-module coordinator: any primary gives the same answer as merging
+    # LOCAL searches on the client
+    q = queries[0]
+    args = ("HNSW.SEARCH", INDEX, "K", K, "QUERY", DIM, *q)
+    expected = hc.search(INDEX, q, K, fanout="client")
+    for node in rc.get_primaries():
+        got = hc_hits(rc.execute_command(*args, target_nodes=node))
+        assert got == expected, (node.name, got, expected)
+        # LOCAL only returns keys stored on that node
+        local = hc_hits(rc.execute_command(*args, "LOCAL", target_nodes=node))
+        assert local and all(rc.get_node_from_key(k).name == node.name for k, _ in local)
+    # cannot block inside MULTI
+    pipe = R(7000).pipeline(transaction=True)
+    pipe.execute_command(*args)
+    res = pipe.execute(raise_on_error=False)[0]
+    assert isinstance(res, ResponseError) and "MULTI" in str(res), res
 
     # exact match is found and ranked first
     key = "vec:7"
@@ -117,12 +151,12 @@ def main():
     # slot migration: move 3000 slots from the first primary to the second
     before = hc.node_counts(INDEX)
     subprocess.run(
-        ["redis-cli", "--cluster", "reshard", "127.0.0.1:7000",
+        [*CLI, "--cluster", "reshard", "127.0.0.1:7000",
          "--cluster-from", node_id(7000), "--cluster-to", node_id(7001),
          "--cluster-slots", "3000", "--cluster-yes"],
         check=True, capture_output=True,
     )
-    rc = RedisCluster(host="127.0.0.1", port=7000)
+    rc = RC()
     hc = HnswCluster(rc)
     after = hc.node_counts(INDEX)
     print("after reshard:", after)
@@ -131,16 +165,17 @@ def main():
     assert shard_consistent(rc, hc)
     r = recall(hc, vectors, queries)
     print(f"recall@{K} after reshard: {r:.3f}")
+    assert recall(hc, vectors, queries, "client") == r
     assert r >= 0.95
 
     # replicas build their own graph from the replication stream
     for primary in rc.get_primaries():
         replica_port = None
-        for line in Redis(port=primary.port).info("replication").items():
+        for line in R(primary.port).info("replication").items():
             if line[0].startswith("slave") and isinstance(line[1], dict):
                 replica_port = line[1]["port"]
         assert replica_port, f"no replica for {primary.name}"
-        replica = Redis(port=replica_port)
+        replica = R(replica_port)
         expected = hc.node_counts(INDEX)[primary.name]
 
         def replica_count():
@@ -151,6 +186,12 @@ def main():
             return int(dict(zip(info[::2], info[1::2]))[b"node_count"])
 
         wait_for(lambda: replica_count() == expected, f"replica {replica_port}")
+
+        # a replica coordinates too, covering its primary's shard itself
+        pipe = replica.pipeline(transaction=False)
+        pipe.execute_command("READONLY")
+        pipe.execute_command(*args)
+        assert hc_hits(pipe.execute()[1]) == hc.search(INDEX, q, K, fanout="client")
 
     # restart from RDB: definitions (including an empty index) and graphs survive
     hc.create_index("empty", dim=2)
@@ -163,6 +204,36 @@ def main():
     # FLUSHALL drops everything; HNSW.DEL removes nodes on every shard
     hc.delete_index(INDEX)
     assert sum(rc.dbsize(target_nodes=n) for n in rc.get_primaries()) == 0
+
+    # a shard that does not answer fails the search instead of hanging it
+    hc.create_index("down", dim=2)
+    sleeping = Redis(port=7002, password=PASSWORD, socket_timeout=30)
+    sleeper = threading.Thread(target=lambda: sleeping.execute_command("DEBUG", "SLEEP", 7))
+    sleeper.start()
+
+    def asleep():
+        # raw socket: redis-py would retry a timed-out PING with backoff
+        with socket.create_connection(("127.0.0.1", 7002), timeout=0.2) as sock:
+            sock.sendall(b"PING\r\n")
+            try:
+                sock.recv(64)
+                return False
+            except TimeoutError:
+                return True
+
+    wait_for(asleep, "shard to stall")
+    start = time.time()
+    try:
+        # longer than the module's 5s shard timeout, so redis-py does not
+        # time out first and retry the search
+        client = Redis(port=7000, password=PASSWORD, socket_timeout=30)
+        client.execute_command("HNSW.SEARCH", "down", "QUERY", 2, 0, 0)
+        raise AssertionError("search should fail while a shard sleeps")
+    except ResponseError as e:
+        assert "failed on shard" in str(e), e
+    print(f"stalled shard fails the search after {time.time() - start:.1f}s")
+    sleeper.join()
+    hc.delete_index("down")
 
     print("OK")
 
