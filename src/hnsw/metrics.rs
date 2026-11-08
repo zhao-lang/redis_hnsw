@@ -15,7 +15,10 @@ pub fn euclidean(v1: &[f32], v2: &[f32], n: usize) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         // TODO remove the check on array length with more flexible avx func
-        if is_x86_feature_detected!("avx2") && v1.len().is_multiple_of(32) {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && v1.len().is_multiple_of(32)
+        {
             return sim_func_avx_euc(v1, v2, n);
         }
     }

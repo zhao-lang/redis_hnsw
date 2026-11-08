@@ -88,3 +88,124 @@ fn error_string_is_plain_message() {
         "owned msg"
     );
 }
+
+/// Deterministic pseudo-random data so failures are reproducible.
+fn lcg_data(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+    let mut s = seed;
+    let mut next = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 40) as f32) / ((1u64 << 24) as f32)
+    };
+    (0..n).map(|_| (0..dim).map(|_| next()).collect()).collect()
+}
+
+fn brute_force_knn(data: &[Vec<f32>], q: &[f32], k: usize) -> Vec<usize> {
+    let mut d: Vec<(f32, usize)> = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (-euclidean(v, q, q.len()), i))
+        .collect();
+    d.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    d.into_iter().take(k).map(|(_, i)| i).collect()
+}
+
+fn recall(index: &Index<f32, f32>, data: &[Vec<f32>], queries: &[Vec<f32>], k: usize) -> f64 {
+    let mut hits = 0;
+    for q in queries {
+        let truth = brute_force_knn(data, q, k);
+        let got: Vec<String> = index
+            .search_knn(q, k)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        hits += truth
+            .iter()
+            .filter(|i| got.contains(&format!("n{}", i)))
+            .count();
+    }
+    hits as f64 / (queries.len() * k) as f64
+}
+
+#[test]
+fn hnsw_recall_vs_brute_force() {
+    let (n, dim, k) = (2000, 16, 10);
+    let data = lcg_data(n, dim, 42);
+    let queries = lcg_data(100, dim, 7);
+    let mut index: Index<f32, f32> = Index::new("r", Box::new(euclidean), dim, 8, 64);
+    for (i, v) in data.iter().enumerate() {
+        index.add_node(&format!("n{}", i), v, |_, _| {}).unwrap();
+    }
+    for node in index.nodes.values() {
+        let r = node.read();
+        for (lc, l) in r.neighbors.iter().enumerate() {
+            let cap = if lc == 0 { index.m_max_0 } else { index.m_max };
+            assert!(
+                l.len() <= cap,
+                "layer {} has {} > {} links",
+                lc,
+                l.len(),
+                cap
+            );
+        }
+    }
+    let r = recall(&index, &data, &queries, k);
+    println!("recall@{} = {:.3}", k, r);
+    assert!(r >= 0.95, "recall@{} = {:.3}", k, r);
+
+    // delete half the nodes; the rest must stay searchable with good recall
+    let mut rng_keep = Vec::new();
+    for i in 0..n {
+        if i % 2 == 0 {
+            index.delete_node(&format!("n{}", i), |_, _| {}).unwrap();
+        } else {
+            rng_keep.push(i);
+        }
+    }
+    for node in index.nodes.values() {
+        let r = node.read();
+        for (lc, l) in r.neighbors.iter().enumerate() {
+            let cap = if lc == 0 { index.m_max_0 } else { index.m_max };
+            assert!(
+                l.len() <= cap,
+                "after delete: layer {} has {} > {} links",
+                lc,
+                l.len(),
+                cap
+            );
+        }
+    }
+    let kept: Vec<Vec<f32>> = rng_keep.iter().map(|&i| data[i].clone()).collect();
+    let mut hits = 0;
+    for q in &queries {
+        let truth: Vec<usize> = brute_force_knn(&kept, q, k)
+            .into_iter()
+            .map(|j| rng_keep[j])
+            .collect();
+        let got: Vec<String> = index
+            .search_knn(q, k)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        hits += truth
+            .iter()
+            .filter(|i| got.contains(&format!("n{}", i)))
+            .count();
+    }
+    let r = hits as f64 / (queries.len() * k) as f64;
+    println!("recall@{} after deleting half = {:.3}", k, r);
+    assert!(r >= 0.9, "recall@{} after delete = {:.3}", k, r);
+}
+
+#[test]
+fn search_returns_k_even_when_k_exceeds_ef() {
+    let data = lcg_data(300, 4, 3);
+    let mut index: Index<f32, f32> = Index::new("k", Box::new(euclidean), 4, 5, 10);
+    for (i, v) in data.iter().enumerate() {
+        index.add_node(&format!("n{}", i), v, |_, _| {}).unwrap();
+    }
+    assert_eq!(index.search_knn(&data[0], 50).unwrap().len(), 50);
+}

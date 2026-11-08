@@ -6,15 +6,12 @@ use super::metrics;
 
 use ordered_float::OrderedFloat;
 use rand::RngExt;
-use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse, min};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::convert::From;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
-// use std::thread;
 
 /// Floating point types usable in the index: full float math plus the total
 /// ordering `OrderedFloat` requires.
@@ -106,7 +103,14 @@ type NodeRefWeak<T> = Weak<RwLock<_Node<T>>>;
 pub struct _Node<T: Float> {
     pub name: String,
     pub data: Vec<T>,
+    /// Outgoing links per layer. As in the paper the graph is directed: a
+    /// node's list is capped at Mmax (Mmax0 on layer 0) and pruning it does not
+    /// touch the lists of the nodes it drops.
     pub neighbors: Vec<Vec<NodeWeak<T>>>,
+    /// Incoming links per layer (nodes whose `neighbors` contain this node).
+    /// Not part of the paper and not persisted: it is rebuilt on load and is
+    /// only needed so deletion can find and repair every node linking here.
+    pub in_neighbors: Vec<Vec<NodeWeak<T>>>,
 }
 
 impl<T> fmt::Debug for _Node<T>
@@ -133,32 +137,21 @@ where
     }
 }
 
-impl<T: Float> _Node<T> {
-    fn push_levels(&mut self, level: usize, capacity: Option<usize>) {
-        let neighbors = &mut self.neighbors;
-        while neighbors.len() < level + 1 {
-            match capacity {
-                Some(cap) => neighbors.push(Vec::with_capacity(cap)),
-                None => neighbors.push(Vec::new()),
-            }
-        }
+fn ensure_level<T: Float>(lists: &mut Vec<Vec<NodeWeak<T>>>, level: usize) {
+    if lists.len() <= level {
+        lists.resize_with(level + 1, Vec::new);
     }
+}
 
-    fn add_neighbor(&mut self, level: usize, neighbor: NodeWeak<T>, capacity: Option<usize>) {
-        self.push_levels(level, capacity);
-        let neighbors = &mut self.neighbors;
-        if !neighbors[level].contains(&neighbor) {
-            neighbors[level].push(neighbor);
-        }
+fn push_unique<T: Float>(list: &mut Vec<NodeWeak<T>>, n: NodeWeak<T>) {
+    if !list.contains(&n) {
+        list.push(n);
     }
+}
 
-    fn rm_neighbor(&mut self, level: usize, neighbor: &NodeWeak<T>) {
-        let neighbors = &mut self.neighbors;
-        let index = neighbors[level]
-            .iter()
-            .position(|n| *n == *neighbor)
-            .unwrap();
-        neighbors[level].remove(index);
+fn remove_link<T: Float>(lists: &mut [Vec<NodeWeak<T>>], level: usize, n: &NodeWeak<T>) {
+    if let Some(list) = lists.get_mut(level) {
+        list.retain(|x| x != n);
     }
 }
 
@@ -208,6 +201,7 @@ impl<T: Float> Node<T> {
             name: name.to_owned(),
             data: data.to_vec(),
             neighbors: Vec::with_capacity(capacity),
+            in_neighbors: Vec::new(),
         };
         Node(Arc::new(RwLock::new(node)))
     }
@@ -220,92 +214,55 @@ impl<T: Float> Node<T> {
         self.0.try_write().unwrap()
     }
 
-    fn push_levels(&self, level: usize, capacity: Option<usize>) {
-        let mut node = self.0.try_write().unwrap();
-        node.push_levels(level, capacity);
-    }
-
-    fn add_neighbor(&self, level: usize, neighbor: NodeWeak<T>, capacity: Option<usize>) {
-        let node = &mut self.0.try_write().unwrap();
-        node.add_neighbor(level, neighbor, capacity);
-    }
-
-    fn rm_neighbor(&self, level: usize, neighbor: &NodeWeak<T>) {
-        let node = &mut self.0.try_write().unwrap();
-        node.rm_neighbor(level, neighbor);
-    }
-
     pub fn downgrade(&self) -> NodeWeak<T> {
         NodeWeak(Arc::downgrade(&self.0))
     }
-}
 
-type SimPairRef<T, R> = Rc<RefCell<_SimPair<T, R>>>;
-
-#[derive(Debug, Clone)]
-struct _SimPair<T, R>
-where
-    T: Float,
-    R: Float,
-{
-    pub sim: OrderedFloat<R>,
-    pub node: Node<T>,
-}
-
-#[derive(Debug, Clone)]
-struct SimPair<T, R>(SimPairRef<T, R>)
-where
-    T: Float,
-    R: Float;
-
-impl<T, R> SimPair<T, R>
-where
-    T: Float,
-    R: Float,
-{
-    fn new(sim: OrderedFloat<R>, node: Node<T>) -> Self {
-        let sp = _SimPair { sim, node };
-        SimPair(Rc::new(RefCell::new(sp)))
+    fn ptr(&self) -> *const RwLock<_Node<T>> {
+        Arc::as_ptr(&self.0)
     }
 
-    fn read(&self) -> Ref<'_, _SimPair<T, R>> {
-        self.0.borrow()
+    /// Make sure the node has link lists for layers 0..=level.
+    fn init_levels(&self, level: usize) {
+        let mut w = self.write();
+        ensure_level(&mut w.neighbors, level);
+        ensure_level(&mut w.in_neighbors, level);
     }
 
-    fn write(&mut self) -> RefMut<'_, _SimPair<T, R>> {
-        self.0.borrow_mut()
+    /// Outgoing links of this node at `level` (empty if it is not on that layer).
+    fn links(&self, level: usize) -> Vec<Node<T>> {
+        self.read()
+            .neighbors
+            .get(level)
+            .map(|l| l.iter().map(NodeWeak::upgrade).collect())
+            .unwrap_or_default()
     }
 }
 
-impl<T, R> PartialEq for SimPair<T, R>
-where
-    T: Float,
-    R: Float,
-{
+/// A node together with its similarity to some base element. Ordered by
+/// similarity, so a max-heap pops the nearest element first.
+struct Scored<T: Float, R: Float> {
+    sim: OrderedFloat<R>,
+    node: Node<T>,
+}
+
+impl<T: Float, R: Float> PartialEq for Scored<T, R> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.borrow().sim == other.0.borrow().sim
+        self.sim == other.sim
     }
 }
 
-impl<T: Float, R: Float> Eq for SimPair<T, R> {}
+impl<T: Float, R: Float> Eq for Scored<T, R> {}
 
-impl<T, R> PartialOrd for SimPair<T, R>
-where
-    T: Float,
-    R: Float,
-{
+impl<T: Float, R: Float> PartialOrd for Scored<T, R> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T, R> Ord for SimPair<T, R>
-where
-    T: Float,
-    R: Float,
-{
+impl<T: Float, R: Float> Ord for Scored<T, R> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.borrow().sim.cmp(&other.0.borrow().sim)
+        self.sim.cmp(&other.sim)
     }
 }
 
@@ -397,26 +354,12 @@ where
         if data.len() != self.data_dim {
             return Err(format!("data dimension: {} does not match Index", data.len()).into());
         }
-
-        if self.node_count == 0 {
-            let node = Node::new(name, data, self.m_max_0);
-            self.enterpoint = Some(node.downgrade());
-
-            let mut layer = HashSet::new();
-            layer.insert(node.downgrade());
-            self.layers.push(layer);
-
-            self.nodes.insert(name.to_owned(), node);
-            self.node_count += 1;
-
-            return Ok(());
-        }
-
         if self.nodes.contains_key(name) {
             return Err(format!("Node: {} already exists", name).into());
         }
 
-        self.insert(name, data, update_fn)
+        self.insert(name, data, update_fn);
+        Ok(())
     }
 
     pub fn delete_node(
@@ -428,55 +371,70 @@ where
             Some(node) => node,
             None => return Err(format!("Node: {} does not exist", name).into()),
         };
-        // self.nodes.shrink_to_fit();
         self.node_count -= 1;
 
-        for lc in (0..(self.max_layer + 1)).rev() {
-            if self.layers[lc].remove(&node.downgrade()) {
-                break;
-            }
+        let weak = node.downgrade();
+        for layer in self.layers.iter_mut() {
+            layer.remove(&weak);
         }
 
+        // Repair every node that links to the deleted one. Its candidates are
+        // its remaining links plus the deleted node's links (the deleted node
+        // was the bridge between them), pruned with the same heuristic as in
+        // insertion.
         let mut updated = HashSet::new();
-        let nr = node.read();
-        for lc in 0..nr.neighbors.len() {
-            let up = self.delete_node_from_neighbors(&node, lc);
-            for u in up {
-                updated.insert(u);
+        let levels = node.read().neighbors.len();
+        for lc in 0..levels {
+            let outs = node.links(lc);
+            let ins: Vec<Node<T>> = node
+                .read()
+                .in_neighbors
+                .get(lc)
+                .map(|l| l.iter().map(NodeWeak::upgrade).collect())
+                .unwrap_or_default();
+
+            for y in &outs {
+                remove_link(&mut y.write().in_neighbors, lc, &weak);
+            }
+
+            for x in &ins {
+                let mut seen: HashSet<_> = [node.ptr(), x.ptr()].into();
+                let candidates: Vec<Node<T>> = x
+                    .links(lc)
+                    .into_iter()
+                    .chain(outs.iter().cloned())
+                    .filter(|c| seen.insert(c.ptr()))
+                    .collect();
+                let scored = self.score(&x.read().data, candidates);
+                let params = SelectParams {
+                    m: self.max_conn(lc),
+                    lc,
+                    extend_candidates: false,
+                    keep_pruned_connections: true,
+                };
+                let new = self.select_neighbors(x, scored, params);
+                self.set_links(x, lc, new);
+                updated.insert(x.clone());
             }
         }
 
         // update nodes in redis
         for n in updated {
             let name = n.read().name.clone();
-            let node = n.clone();
-            update_fn(name, node);
+            update_fn(name, n);
         }
 
-        // update enterpoint if necessary
-        match &self.enterpoint {
-            Some(ep) if node == ep.upgrade() => {
-                let mut new_ep = None;
-                for lc in (0..(self.max_layer + 1)).rev() {
-                    match self.layers[lc].iter().next() {
-                        Some(n) => {
-                            new_ep = Some(n.clone());
-                            break;
-                        }
-                        None => {
-                            // self.layers[lc].shrink_to_fit();
-                            self.layers.pop();
-                            if self.max_layer > 0 {
-                                self.max_layer -= 1;
-                            }
-                            continue;
-                        }
-                    }
+        // pick a new enterpoint from the highest non-empty layer
+        if self.enterpoint.as_ref() == Some(&weak) {
+            self.enterpoint = None;
+            while let Some(top) = self.layers.last() {
+                if let Some(n) = top.iter().next() {
+                    self.enterpoint = Some(n.clone());
+                    break;
                 }
-                // self.layers.shrink_to_fit();
-                self.enterpoint = new_ep;
+                self.layers.pop();
             }
-            _ => (),
+            self.max_layer = self.layers.len().saturating_sub(1);
         }
 
         Ok(())
@@ -490,120 +448,171 @@ where
             return Ok(Vec::new());
         }
 
-        Ok(self.search_knn_internal(data, k, self.ef_construction))
+        // The paper requires ef >= K for the search to be able to return K results.
+        Ok(self.search_knn_internal(data, k, self.ef_construction.max(k)))
     }
 
-    // perform insertion of new nodes into the index
-    fn insert(
-        &mut self,
-        name: &str,
-        data: &[T],
-        update_fn: impl Fn(String, Node<T>),
-    ) -> Result<(), HNSWError> {
-        let l = self.gen_random_level();
-        let l_max = self.max_layer;
-
-        if l_max == 0 {
-            self.nodes
-                .insert(name.to_owned(), Node::new(name, data, self.m_max_0));
-        } else {
-            self.nodes
-                .insert(name.to_owned(), Node::new(name, data, self.m_max));
+    /// Recompute every node's `in_neighbors` from the outgoing links. Call
+    /// after building the graph from storage.
+    pub fn rebuild_in_neighbors(&self) {
+        for n in self.nodes.values() {
+            n.write().in_neighbors.clear();
         }
+        for n in self.nodes.values() {
+            let outs: Vec<Vec<Node<T>>> = (0..n.read().neighbors.len())
+                .map(|lc| n.links(lc))
+                .collect();
+            let src = n.downgrade();
+            for (lc, layer) in outs.iter().enumerate() {
+                for y in layer {
+                    let mut w = y.write();
+                    ensure_level(&mut w.in_neighbors, lc);
+                    push_unique(&mut w.in_neighbors[lc], src.clone());
+                }
+            }
+        }
+    }
+
+    fn max_conn(&self, lc: usize) -> usize {
+        if lc == 0 { self.m_max_0 } else { self.m_max }
+    }
+
+    fn sim(&self, a: &[T], b: &[T]) -> OrderedFloat<R> {
+        OrderedFloat::from((self.mfunc)(a, b, self.data_dim))
+    }
+
+    fn score(&self, base: &[T], nodes: Vec<Node<T>>) -> Vec<Scored<T, R>> {
+        nodes
+            .into_iter()
+            .map(|node| {
+                let sim = self.sim(base, &node.read().data);
+                Scored { sim, node }
+            })
+            .collect()
+    }
+
+    /// Add the directed edge a -> b on layer `lc`.
+    fn link(&self, a: &Node<T>, b: &Node<T>, lc: usize) {
+        // Lists are sized defensively: graphs saved by older versions created
+        // per-layer lists lazily, so a node may lack lists for its upper layers.
+        let mut aw = a.write();
+        ensure_level(&mut aw.neighbors, lc);
+        push_unique(&mut aw.neighbors[lc], b.downgrade());
+        drop(aw);
+        let mut bw = b.write();
+        ensure_level(&mut bw.in_neighbors, lc);
+        push_unique(&mut bw.in_neighbors[lc], a.downgrade());
+    }
+
+    /// Replace the outgoing links of `node` on layer `lc` ("set
+    /// neighbourhood(e) at layer lc to eNewConn" in alg. 1), keeping the
+    /// reverse links of the affected nodes in sync.
+    fn set_links(&self, node: &Node<T>, lc: usize, new: Vec<Scored<T, R>>) {
+        let me = node.downgrade();
+        let new: Vec<NodeWeak<T>> = new.into_iter().map(|s| s.node.downgrade()).collect();
+        let old = std::mem::take(&mut node.write().neighbors[lc]);
+        for o in old.iter().filter(|o| !new.contains(o)) {
+            remove_link(&mut o.upgrade().write().in_neighbors, lc, &me);
+        }
+        for n in new.iter().filter(|n| !old.contains(n)) {
+            let n = n.upgrade();
+            let mut w = n.write();
+            ensure_level(&mut w.in_neighbors, lc);
+            push_unique(&mut w.in_neighbors[lc], me.clone());
+        }
+        node.write().neighbors[lc] = new;
+    }
+
+    /// INSERT (alg. 1)
+    fn insert(&mut self, name: &str, data: &[T], update_fn: impl Fn(String, Node<T>)) {
+        let l = self.gen_random_level();
+        let query = Node::new(name, data, l + 1);
+        query.init_levels(l);
+        self.nodes.insert(name.to_owned(), query.clone());
         self.node_count += 1;
 
-        let query = self.nodes.get(name).unwrap();
-        let mut ep = self.enterpoint.as_ref().unwrap().clone();
-        let mut w: BinaryHeap<SimPair<T, R>>;
-
-        let mut lc = l_max;
-        while lc > l {
-            w = self.search_level(data, &ep.upgrade(), 1, lc);
-            ep = w.pop().unwrap().read().node.downgrade();
-
-            if lc == 0 {
-                break;
+        let ep = match &self.enterpoint {
+            Some(ep) => ep.upgrade(),
+            None => {
+                // first element: it is the whole graph
+                self.max_layer = l;
+                self.enterpoint = Some(query.downgrade());
+                self.layers = (0..=l).map(|_| HashSet::new()).collect();
+                self.layers[l].insert(query.downgrade());
+                return;
             }
-            lc -= 1;
+        };
+        let l_max = self.max_layer;
+
+        // phase 1: greedy search (ef = 1) through the layers above l
+        let mut eps = vec![ep];
+        for lc in (l + 1..=l_max).rev() {
+            let w = self.search_layer(data, &eps, 1, lc);
+            eps = vec![w.into_iter().next().unwrap().node];
         }
 
+        // phase 2: connect on layers min(L, l)..=0
         let mut updated = HashSet::new();
-        for lc in (0..(min(l_max, l) + 1)).rev() {
-            w = self.search_level(data, &ep.upgrade(), self.ef_construction, lc);
+        for lc in (0..=min(l_max, l)).rev() {
+            let w = self.search_layer(data, &eps, self.ef_construction, lc);
+            let candidates: Vec<Scored<T, R>> = w
+                .iter()
+                .map(|s| Scored {
+                    sim: s.sim,
+                    node: s.node.clone(),
+                })
+                .collect();
             let params = SelectParams {
                 m: self.m,
                 lc,
-                extend_candidates: true,
+                extend_candidates: false,
                 keep_pruned_connections: true,
             };
-            let mut neighbors = self.select_neighbors(query, &w, params, None);
-            self.connect_neighbors(query, &neighbors, lc);
+            let neighbors = self.select_neighbors(&query, candidates, params);
 
-            // add node to list of nodes to be updated in redis
-            for npair in &neighbors {
-                updated.insert(npair.read().node.clone());
+            // add bidirectional connections from neighbors to q
+            for e in &neighbors {
+                self.link(&query, &e.node, lc);
+                self.link(&e.node, &query, lc);
             }
 
-            // shrink connections as needed
-            while !neighbors.is_empty() {
-                let epair = neighbors.pop().unwrap();
-                let er = epair.read();
-
-                let mut econn: BinaryHeap<SimPair<T, R>>;
-                {
-                    let enr = er.node.read();
-                    let eneighbors = &enr.neighbors[lc];
-                    econn = BinaryHeap::with_capacity(eneighbors.len());
-                    for n in eneighbors {
-                        let ensim = OrderedFloat::from((self.mfunc)(
-                            &enr.data,
-                            &n.upgrade().read().data,
-                            self.data_dim,
-                        ));
-                        let enpair = SimPair::new(ensim, n.upgrade());
-                        econn.push(enpair);
-                    }
-                }
-
-                let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
+            // shrink the neighbors' connections if they are now over capacity
+            let m_max = self.max_conn(lc);
+            for e in &neighbors {
+                let econn = e.node.links(lc);
                 if econn.len() > m_max {
+                    let scored = self.score(&e.node.read().data, econn);
                     let params = SelectParams {
                         m: m_max,
                         lc,
-                        extend_candidates: true,
+                        extend_candidates: false,
                         keep_pruned_connections: true,
                     };
-                    let enewconn = self.select_neighbors(&er.node, &econn, params, None);
-                    let up = self.update_node_connections(&er.node, &enewconn, &econn, lc, None);
-                    for u in up {
-                        updated.insert(u);
-                    }
+                    let enewconn = self.select_neighbors(&e.node, scored, params);
+                    self.set_links(&e.node, lc, enewconn);
                 }
+                updated.insert(e.node.clone());
             }
 
-            ep = w.peek().unwrap().read().node.downgrade();
+            // ep <- W: all found neighbors are entry points for the next layer
+            eps = w.into_iter().map(|s| s.node).collect();
         }
 
         // update nodes in redis
         for n in updated {
             let name = n.read().name.clone();
-            let node = n.clone();
-            update_fn(name, node);
+            update_fn(name, n);
         }
 
         // new enterpoint if we're in a higher layer
         if l > l_max {
             self.max_layer = l;
             self.enterpoint = Some(query.downgrade());
-            while self.layers.len() < l + 1 {
-                self.layers.push(HashSet::new());
-            }
         }
-
-        // add node to layer set
+        while self.layers.len() <= l {
+            self.layers.push(HashSet::new());
+        }
         self.layers[l].insert(query.downgrade());
-
-        Ok(())
     }
 
     fn gen_random_level(&mut self) -> usize {
@@ -612,287 +621,134 @@ where
         (-r.ln() * self.level_mult) as usize
     }
 
-    fn search_level(
+    /// SEARCH-LAYER (alg. 2). Returns the ef nearest elements found, nearest first.
+    fn search_layer(
         &self,
         query: &[T],
-        ep: &Node<T>,
+        eps: &[Node<T>],
         ef: usize,
-        level: usize,
-    ) -> BinaryHeap<SimPair<T, R>> {
-        let mut v = HashSet::with_capacity(ef);
-
-        {
-            v.insert(ep.clone());
+        lc: usize,
+    ) -> Vec<Scored<T, R>> {
+        let mut v = HashSet::new(); // visited
+        let mut c = BinaryHeap::new(); // candidates, nearest on top
+        let mut w = BinaryHeap::new(); // found nearest, furthest on top
+        for ep in eps {
+            if v.insert(ep.ptr()) {
+                let sim = self.sim(query, &ep.read().data);
+                c.push(Scored {
+                    sim,
+                    node: ep.clone(),
+                });
+                w.push(Reverse(Scored {
+                    sim,
+                    node: ep.clone(),
+                }));
+            }
         }
-        let qsim: OrderedFloat<R>;
-        {
-            qsim = OrderedFloat::from((self.mfunc)(query, &ep.read().data, self.data_dim));
+        while w.len() > ef {
+            w.pop();
         }
-        let qpair = SimPair::new(qsim, ep.clone());
 
-        let mut c = BinaryHeap::with_capacity(ef);
-        let mut w = BinaryHeap::with_capacity(ef);
-        c.push(qpair.clone());
-        w.push(Reverse(qpair));
-
-        while !c.is_empty() {
-            let mut cpair = c.pop().unwrap();
-            let mut fpair = w.peek().unwrap();
-
-            {
-                if cpair.read().sim < fpair.0.read().sim {
-                    break;
+        while let Some(cur) = c.pop() {
+            let furthest = w.peek().unwrap().0.sim;
+            if cur.sim < furthest {
+                break; // all elements in W are evaluated
+            }
+            for e in cur.node.links(lc) {
+                if !v.insert(e.ptr()) {
+                    continue;
                 }
-            }
-
-            // update C and W
-            {
-                cpair.write().node.push_levels(level, Some(self.m_max_0));
-            }
-            let cpr = cpair.read();
-            let neighbors = &cpr.node.read().neighbors[level];
-            for neighbor in neighbors {
-                let neighbor = neighbor.upgrade();
-                if !v.contains(&neighbor) {
-                    v.insert(neighbor.clone());
-
-                    fpair = w.peek().unwrap();
-                    let esim = OrderedFloat::from((self.mfunc)(
-                        query,
-                        &neighbor.read().data,
-                        self.data_dim,
-                    ));
-                    if esim > fpair.0.read().sim || w.len() < ef {
-                        let epair = SimPair::new(esim, neighbor.clone());
-                        c.push(epair.clone());
-                        w.push(Reverse(epair));
-
-                        if w.len() > ef {
-                            w.pop();
-                        }
+                let sim = self.sim(query, &e.read().data);
+                if w.len() < ef || sim > w.peek().unwrap().0.sim {
+                    c.push(Scored {
+                        sim,
+                        node: e.clone(),
+                    });
+                    w.push(Reverse(Scored { sim, node: e }));
+                    if w.len() > ef {
+                        w.pop();
                     }
                 }
             }
         }
 
-        let mut res = BinaryHeap::new();
-        for pair in w {
-            res.push(pair.0);
-        }
-        res
+        // ascending order of Reverse == descending similarity
+        w.into_sorted_vec().into_iter().map(|r| r.0).collect()
     }
 
+    /// SELECT-NEIGHBORS-HEURISTIC (alg. 4). `candidates` are scored against
+    /// `base`; returns at most `params.m` elements, nearest first.
     fn select_neighbors(
         &self,
-        query: &Node<T>,
-        c: &BinaryHeap<SimPair<T, R>>,
+        base: &Node<T>,
+        candidates: Vec<Scored<T, R>>,
         params: SelectParams,
-        ignored_node: Option<&Node<T>>,
-    ) -> BinaryHeap<SimPair<T, R>> {
-        let mut r: BinaryHeap<SimPair<T, R>> = BinaryHeap::with_capacity(params.m);
-        let mut w = c.clone();
-        let mut wd = BinaryHeap::new();
+    ) -> Vec<Scored<T, R>> {
+        let base_data = base.read().data.clone();
+        let mut seen: HashSet<_> = [base.ptr()].into();
+        let mut w = BinaryHeap::with_capacity(candidates.len());
+        let mut originals = Vec::new();
+        for s in candidates {
+            if seen.insert(s.node.ptr()) {
+                if params.extend_candidates {
+                    originals.push(s.node.clone());
+                }
+                w.push(s);
+            }
+        }
 
         // extend candidates by their neighbors
-        if params.extend_candidates {
-            let mut ccopy = c.clone();
-
-            let mut v = HashSet::with_capacity(ccopy.capacity());
-            while !ccopy.is_empty() {
-                let epair = ccopy.pop().unwrap();
-                v.insert(epair.read().node.clone());
-            }
-
-            ccopy = c.clone();
-            while !ccopy.is_empty() {
-                let epair = ccopy.pop().unwrap();
-
-                for eneighbor in &epair.read().node.read().neighbors[params.lc] {
-                    let eneighbor = eneighbor.upgrade();
-                    if eneighbor == *query
-                        || (ignored_node.is_some() && eneighbor == *ignored_node.unwrap())
-                    {
-                        continue;
-                    }
-
-                    if !v.contains(&eneighbor) {
-                        let ensim = OrderedFloat::from((self.mfunc)(
-                            &query.read().data,
-                            &eneighbor.read().data,
-                            self.data_dim,
-                        ));
-                        let enpair = SimPair::new(ensim, eneighbor.clone());
-                        w.push(enpair);
-                        v.insert(eneighbor.clone());
-                    }
+        for e in originals {
+            for eadj in e.links(params.lc) {
+                if seen.insert(eadj.ptr()) {
+                    let sim = self.sim(&base_data, &eadj.read().data);
+                    w.push(Scored { sim, node: eadj });
                 }
             }
         }
 
-        while !w.is_empty() && r.len() < params.m {
-            let epair = w.pop().unwrap();
-            let enr = epair.read();
-
-            if enr.node == *query || (ignored_node.is_some() && enr.node == *ignored_node.unwrap())
-            {
-                continue;
-            }
-
-            if r.is_empty() || enr.sim > r.peek().unwrap().read().sim {
-                r.push(epair.clone());
+        let mut r: Vec<Scored<T, R>> = Vec::with_capacity(params.m);
+        let mut wd = Vec::new(); // discarded, in nearest-first order
+        while r.len() < params.m {
+            let Some(e) = w.pop() else { break };
+            // keep e only if it is closer to the base element than to any
+            // already selected element
+            let good = {
+                let ed = e.node.read();
+                r.iter()
+                    .all(|s| self.sim(&ed.data, &s.node.read().data) <= e.sim)
+            };
+            if good {
+                r.push(e);
             } else {
-                wd.push(epair.clone());
+                wd.push(e);
             }
         }
 
         // add back some of the discarded connections
         if params.keep_pruned_connections {
-            while !wd.is_empty() && r.len() < params.m {
-                let ppair = wd.pop().unwrap();
-                {
-                    let pr = ppair.read();
-                    if pr.node == *query
-                        || (ignored_node.is_some() && pr.node == *ignored_node.unwrap())
-                    {
-                        continue;
-                    }
-                }
-                r.push(ppair);
-            }
+            let room = params.m - r.len();
+            r.extend(wd.into_iter().take(room));
         }
 
         r
     }
 
-    fn connect_neighbors(
-        &self,
-        query: &Node<T>,
-        neighbors: &BinaryHeap<SimPair<T, R>>,
-        level: usize,
-    ) {
-        let mut neighbors = neighbors.clone();
-        while !neighbors.is_empty() {
-            let npair = neighbors.pop().unwrap();
-            let npr = npair.read();
-
-            query.add_neighbor(level, npr.node.downgrade(), Some(self.m_max_0));
-            npr.node
-                .add_neighbor(level, query.downgrade(), Some(self.m_max_0));
-        }
-    }
-
-    fn update_node_connections(
-        &self,
-        node: &Node<T>,
-        new_neighbors: &BinaryHeap<SimPair<T, R>>,
-        old_neighbors: &BinaryHeap<SimPair<T, R>>,
-        level: usize,
-        ignored_node: Option<&Node<T>>,
-    ) -> HashSet<Node<T>> {
-        let mut newconn = new_neighbors.clone();
-        let mut rmconn = old_neighbors.clone().into_vec();
-        let mut updated = HashSet::new();
-        updated.insert(node.clone());
-
-        // bidirectionally connect new neighbors
-        while !newconn.is_empty() {
-            let newpair = newconn.pop().unwrap();
-            let npr = newpair.read();
-            node.add_neighbor(level, npr.node.downgrade(), Some(self.m_max_0));
-            npr.node
-                .add_neighbor(level, node.downgrade(), Some(self.m_max_0));
-            updated.insert(npr.node.clone());
-            // if new neighbor exists in the old set then we remove it from
-            // the set of neighbors to be removed
-            if let Some(index) = rmconn.iter().position(|n| n.read().node == npr.node) {
-                rmconn.remove(index);
-            }
-        }
-
-        // bidirectionally remove old connections
-        while let Some(rmpair) = rmconn.pop() {
-            let rmpr = rmpair.read();
-            node.rm_neighbor(level, &rmpr.node.downgrade());
-            // if node to be removed is the ignored node then pass
-            match ignored_node {
-                Some(n) if rmpr.node == *n => {
-                    continue;
-                }
-                _ => {
-                    rmpr.node.rm_neighbor(level, &node.downgrade());
-                    updated.insert(rmpr.node.clone());
-                }
-            }
-        }
-
-        updated
-    }
-
-    fn delete_node_from_neighbors(&self, node: &Node<T>, lc: usize) -> HashSet<Node<T>> {
-        let r = node.read();
-        let neighbors = &r.neighbors[lc];
-        let mut updated = HashSet::new();
-
-        for n in neighbors {
-            let n = n.upgrade();
-            let nnewconn: BinaryHeap<SimPair<T, R>>;
-            let mut nconn: BinaryHeap<SimPair<T, R>>;
-            {
-                let nr = n.read();
-                let nneighbors = &nr.neighbors[lc];
-                nconn = BinaryHeap::with_capacity(nneighbors.len());
-
-                for nn in nneighbors {
-                    let nn = nn.upgrade();
-                    let nnsim =
-                        OrderedFloat::from((self.mfunc)(&nr.data, &nn.read().data, self.data_dim));
-                    let nnpair = SimPair::new(nnsim, nn.to_owned());
-                    nconn.push(nnpair);
-                }
-
-                let m_max = if lc == 0 { self.m_max_0 } else { self.m_max };
-                let params = SelectParams {
-                    m: m_max,
-                    lc,
-                    extend_candidates: true,
-                    keep_pruned_connections: true,
-                };
-                nnewconn = self.select_neighbors(&n, &nconn, params, Some(node));
-            }
-            updated.insert(n.clone());
-            let up = self.update_node_connections(&n, &nnewconn, &nconn, lc, Some(node));
-            for u in up {
-                updated.insert(u);
-            }
-        }
-
-        updated
-    }
-
+    /// K-NN-SEARCH (alg. 5)
     fn search_knn_internal(&self, query: &[T], k: usize, ef: usize) -> Vec<SearchResult<T, R>> {
-        let mut ep = self.enterpoint.as_ref().unwrap().clone();
-        let l_max = self.max_layer;
-
-        let mut lc = l_max;
-        while lc > 0 {
-            let w = self.search_level(query, &ep.upgrade(), 1, lc);
-            ep = w.peek().unwrap().read().node.downgrade();
-            lc -= 1;
+        let mut eps = vec![self.enterpoint.as_ref().unwrap().upgrade()];
+        for lc in (1..=self.max_layer).rev() {
+            let w = self.search_layer(query, &eps, 1, lc);
+            eps = vec![w.into_iter().next().unwrap().node];
         }
 
-        let mut w = self.search_level(query, &ep.upgrade(), ef, 0);
-
-        let mut res = Vec::with_capacity(k);
-        while res.len() < k && !w.is_empty() {
-            let c = w.pop().unwrap();
-            let cr = c.read();
-            let cnr = cr.node.read();
-            res.push(SearchResult::new(
-                cr.sim,
-                (cnr.name.split('.').collect::<Vec<&str>>()).last().unwrap(),
-                &cnr.data,
-            ));
-        }
-        res
+        self.search_layer(query, &eps, ef, 0)
+            .into_iter()
+            .take(k)
+            .map(|s| {
+                let nr = s.node.read();
+                SearchResult::new(s.sim, nr.name.rsplit('.').next().unwrap(), &nr.data)
+            })
+            .collect()
     }
 }

@@ -138,6 +138,10 @@ fn new_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let data_dim = parsed.remove("dim").unwrap().as_u64()? as usize;
     let m = parsed.remove("m").unwrap().as_u64()? as usize;
     let ef_construction = parsed.remove("efcon").unwrap().as_u64()? as usize;
+    // mL = 1/ln(M) is undefined for M < 2
+    if m < 2 {
+        return Err(RedisError::Str("M must be at least 2"));
+    }
 
     // write to redis
     let key = open_key_writable(ctx, &index_name);
@@ -311,6 +315,8 @@ fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
         None => None,
     };
 
+    index.rebuild_in_neighbors();
+
     Ok(index)
 }
 
@@ -381,7 +387,10 @@ fn delete_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let index = load_index(ctx, &index_name)?;
     let mut index = index.try_write().map_err(|e| err(e.to_string()))?;
 
-    let node = index.nodes.get(&node_name).unwrap();
+    let node = index
+        .nodes
+        .get(&node_name)
+        .ok_or_else(|| err(format!("Node: {} does not exist", node_name)))?;
     if Arc::strong_count(&node.0) > 1 {
         return Err(err(format!(
             "{} is being accessed, unable to delete. Try again later",
