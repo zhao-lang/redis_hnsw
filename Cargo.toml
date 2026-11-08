@@ -1,6 +1,6 @@
 [package]
 name = "redis_hnsw"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Zhao Lang <eltoshan@gmail.com>"]
 edition = "2024"
 rust-version = "1.88"

@@ -1,334 +1,36 @@
 use redis_module::native_types::RedisType;
-use redis_module::{RedisValue, raw};
+use redis_module::{RedisString, RedisValue, raw};
 
-use std::collections::HashMap;
-use std::convert::From;
-use std::os::raw::c_void;
-use std::{fmt, ptr};
+use std::ffi::CString;
+use std::os::raw::{c_int, c_void};
+use std::ptr;
 
-use super::hnsw::{Float, Index, Node, SearchResult, metrics};
+use super::hnsw::SearchResult;
 
-static INDEX_VERSION: i32 = 0;
-static NODE_VERSION: i32 = 0;
+/// Encoding version of the node type.
+///
+/// v0 stored the graph's neighbor lists inside every node key, plus a separate
+/// index key. v1 stores only the vector and the parameters of the index it
+/// belongs to: the graph is a shard-local structure derived from the keys, so
+/// keys can move between cluster shards freely.
+const NODE_VERSION: i32 = 1;
 
-impl From<IndexRedis> for Index<f32, f32> {
-    fn from(index: IndexRedis) -> Self {
-        Index {
-            name: index.name.clone(),
-            mfunc: match index.mfunc_kind.as_str() {
-                "Euclidean" => Box::new(metrics::euclidean),
-                _ => Box::new(metrics::euclidean),
-            },
-            mfunc_kind: match index.mfunc_kind.as_str() {
-                "Euclidean" => metrics::MetricFuncs::Euclidean,
-                _ => metrics::MetricFuncs::Euclidean,
-            },
-            data_dim: index.data_dim,
-            m: index.m,
-            m_max: index.m_max,
-            m_max_0: index.m_max_0,
-            ef_construction: index.ef_construction,
-            level_mult: index.level_mult,
-            node_count: index.node_count,
-            max_layer: index.max_layer,
-            // the next 3 need to be populated from redis
-            layers: Vec::new(),
-            nodes: HashMap::new(),
-            enterpoint: None,
-        }
-    }
+/// The parameters that define an index. Every shard keeps its own copy, and
+/// every node carries one, so a shard that receives a node (slot migration,
+/// replication) can build the index even if `HNSW.NEW` never reached it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexParams {
+    pub dim: usize,
+    pub m: usize,
+    pub ef_construction: usize,
 }
 
-#[derive(Default, Clone)]
-pub struct IndexRedis {
-    pub name: String,               // index name
-    pub mfunc_kind: String,         // kind of the metric function
-    pub data_dim: usize,            // dimensionality of the data
-    pub m: usize,                   // out vertexs per node
-    pub m_max: usize,               // max number of vertexes per node
-    pub m_max_0: usize,             // max number of vertexes at layer 0
-    pub ef_construction: usize,     // size of dynamic candidate list
-    pub level_mult: f64,            // level generation factor
-    pub node_count: usize,          // count of nodes
-    pub max_layer: usize,           // idx of top layer
-    pub layers: Vec<Vec<String>>,   // distinct nodes in each layer
-    pub nodes: Vec<String>,         // set of node names
-    pub enterpoint: Option<String>, // string key to the enterpoint node
-}
-
-impl<T: Float, R: Float> From<Index<T, R>> for IndexRedis {
-    fn from(index: Index<T, R>) -> Self {
-        IndexRedis {
-            name: index.name.clone(),
-            mfunc_kind: format!("{:?}", index.mfunc_kind),
-            data_dim: index.data_dim,
-            m: index.m,
-            m_max: index.m_max,
-            m_max_0: index.m_max_0,
-            ef_construction: index.ef_construction,
-            level_mult: index.level_mult,
-            node_count: index.node_count,
-            max_layer: index.max_layer,
-            layers: index
-                .layers
-                .iter()
-                .map(|l| {
-                    l.iter()
-                        .map(|n| n.upgrade().read().name.clone())
-                        .collect::<Vec<String>>()
-                })
-                .collect(),
-            nodes: index.nodes.keys().cloned().collect::<Vec<String>>(),
-            enterpoint: index
-                .enterpoint
-                .as_ref()
-                .map(|ep| ep.upgrade().read().name.clone()),
-        }
-    }
-}
-
-impl fmt::Debug for IndexRedis {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "name: {}, \
-             metric: {:?}, \
-             data_dim: {}, \
-             M: {}, \
-             ef_construction: {}, \
-             level_mult: {}, \
-             node_count: {}, \
-             max_layer: {}, \
-             enterpoint: {}",
-            self.name,
-            self.mfunc_kind,
-            self.data_dim,
-            self.m,
-            self.ef_construction,
-            self.level_mult,
-            self.node_count,
-            self.max_layer,
-            match &self.enterpoint {
-                Some(ep) => ep.as_str(),
-                None => "null",
-            },
-        )
-    }
-}
-
-impl From<IndexRedis> for RedisValue {
-    fn from(index: IndexRedis) -> Self {
-        let reply: Vec<RedisValue> = vec![
-            "name".into(),
-            index.name.as_str().into(),
-            "metric".into(),
-            index.mfunc_kind.as_str().into(),
-            "data_dim".into(),
-            index.data_dim.into(),
-            "m".into(),
-            index.m.into(),
-            "ef_construction".into(),
-            index.ef_construction.into(),
-            "level_mult".into(),
-            index.level_mult.into(),
-            "node_count".into(),
-            index.node_count.into(),
-            "max_layer".into(),
-            index.max_layer.into(),
-            "enterpoint".into(),
-            index.enterpoint.into(),
-        ];
-        reply.into()
-    }
-}
-
-pub static HNSW_INDEX_REDIS_TYPE: RedisType = RedisType::new(
-    "hnswindex",
-    INDEX_VERSION,
-    raw::RedisModuleTypeMethods {
-        version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
-        rdb_load: Some(load_index),
-        rdb_save: Some(save_index),
-        aof_rewrite: None,
-        free: Some(free_index),
-
-        mem_usage: None,
-        digest: None,
-
-        aux_load: None,
-        aux_save: None,
-        aux_save2: None,
-        aux_save_triggers: 0,
-
-        free_effort: None,
-        unlink: None,
-        copy: None,
-        defrag: None,
-
-        copy2: None,
-        free_effort2: None,
-        mem_usage2: None,
-        unlink2: None,
-    },
-);
-
-unsafe extern "C" fn free_index(value: *mut c_void) {
-    drop(unsafe { Box::from_raw(value as *mut IndexRedis) });
-}
-
-// RDB layout must stay byte-for-byte compatible with existing dumps; bump
-// INDEX_VERSION if it ever changes.
-unsafe extern "C" fn load_index(rdb: *mut raw::RedisModuleIO, version: i32) -> *mut c_void {
-    if version != INDEX_VERSION {
-        return ptr::null_mut();
-    }
-    match read_index(rdb) {
-        Some(index) => Box::into_raw(Box::new(index)) as *mut c_void,
-        None => ptr::null_mut(),
-    }
-}
-
-fn read_index(rdb: *mut raw::RedisModuleIO) -> Option<IndexRedis> {
-    let mut index = IndexRedis {
-        name: load_str(rdb)?,
-        mfunc_kind: load_str(rdb)?,
-        data_dim: load_usize(rdb)?,
-        m: load_usize(rdb)?,
-        m_max: load_usize(rdb)?,
-        m_max_0: load_usize(rdb)?,
-        ef_construction: load_usize(rdb)?,
-        level_mult: raw::load_double(rdb).ok()?,
-        node_count: load_usize(rdb)?,
-        max_layer: load_usize(rdb)?,
-        ..Default::default()
-    };
-
-    let num_layers = load_usize(rdb)?;
-    index.layers = Vec::with_capacity(num_layers);
-    for _ in 0..num_layers {
-        index.layers.push(load_str_vec(rdb)?);
-    }
-
-    index.nodes = load_str_vec(rdb)?;
-
-    let ep = load_str(rdb)?;
-    index.enterpoint = if ep == "null" { None } else { Some(ep) };
-
-    Some(index)
-}
-
-unsafe extern "C" fn save_index(rdb: *mut raw::RedisModuleIO, value: *mut c_void) {
-    // Borrow only: Redis still owns the value after saving.
-    let index = unsafe { &*(value as *const IndexRedis) };
-
-    raw::save_string(rdb, &index.name);
-    raw::save_string(rdb, &index.mfunc_kind);
-    raw::save_unsigned(rdb, index.data_dim as u64);
-    raw::save_unsigned(rdb, index.m as u64);
-    raw::save_unsigned(rdb, index.m_max as u64);
-    raw::save_unsigned(rdb, index.m_max_0 as u64);
-    raw::save_unsigned(rdb, index.ef_construction as u64);
-    raw::save_double(rdb, index.level_mult);
-    raw::save_unsigned(rdb, index.node_count as u64);
-    raw::save_unsigned(rdb, index.max_layer as u64);
-
-    raw::save_unsigned(rdb, index.layers.len() as u64);
-    for layer in &index.layers {
-        save_str_vec(rdb, layer);
-    }
-
-    save_str_vec(rdb, &index.nodes);
-
-    raw::save_string(rdb, index.enterpoint.as_deref().unwrap_or("null"));
-}
-
-fn load_usize(rdb: *mut raw::RedisModuleIO) -> Option<usize> {
-    raw::load_unsigned(rdb).ok()?.try_into().ok()
-}
-
-fn load_str(rdb: *mut raw::RedisModuleIO) -> Option<String> {
-    let s = raw::load_string(rdb).ok()?;
-    s.try_as_str().ok().map(str::to_owned)
-}
-
-/// A length-prefixed list of strings.
-fn load_str_vec(rdb: *mut raw::RedisModuleIO) -> Option<Vec<String>> {
-    let n = load_usize(rdb)?;
-    (0..n).map(|_| load_str(rdb)).collect()
-}
-
-fn save_str_vec(rdb: *mut raw::RedisModuleIO, v: &[String]) {
-    raw::save_unsigned(rdb, v.len() as u64);
-    for s in v {
-        raw::save_string(rdb, s);
-    }
-}
-
-#[derive(Default)]
+/// The value stored at a vector key.
+#[derive(Clone, Debug)]
 pub struct NodeRedis {
+    pub index: String,
+    pub params: IndexParams,
     pub data: Vec<f32>,
-    pub neighbors: Vec<Vec<String>>, // vector of neighbor node names
-}
-
-impl From<&Node<f32>> for NodeRedis {
-    fn from(node: &Node<f32>) -> Self {
-        let r = node.read();
-        NodeRedis {
-            data: r.data.to_owned(),
-            neighbors: r
-                .neighbors
-                .iter()
-                .map(|l| {
-                    l.iter()
-                        .map(|n| n.upgrade().read().name.clone())
-                        .collect::<Vec<String>>()
-                })
-                .collect(),
-        }
-    }
-}
-
-impl fmt::Debug for NodeRedis {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "data: {:?}, \
-             neighbors: {:?}",
-            self.data, self.neighbors,
-        )
-    }
-}
-
-impl From<&NodeRedis> for RedisValue {
-    fn from(n: &NodeRedis) -> Self {
-        let mut reply: Vec<RedisValue> = Vec::new();
-
-        reply.push("data".into());
-        reply.push(
-            n.data
-                .iter()
-                .map(|x| *x as f64)
-                .collect::<Vec<f64>>()
-                .into(),
-        );
-
-        reply.push("neighbors".into());
-        reply.push(
-            n.neighbors
-                .iter()
-                .map(|layer| {
-                    layer
-                        .iter()
-                        .map(|node| node.into())
-                        .collect::<Vec<RedisValue>>()
-                        .into()
-                })
-                .collect::<Vec<RedisValue>>()
-                .into(),
-        );
-
-        reply.into()
-    }
 }
 
 pub static HNSW_NODE_REDIS_TYPE: RedisType = RedisType::new(
@@ -338,16 +40,18 @@ pub static HNSW_NODE_REDIS_TYPE: RedisType = RedisType::new(
         version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
         rdb_load: Some(load_node),
         rdb_save: Some(save_node),
-        aof_rewrite: None,
+        aof_rewrite: Some(rewrite_node),
         free: Some(free_node),
 
-        mem_usage: None,
+        mem_usage: Some(mem_usage_node),
         digest: None,
 
-        aux_load: None,
-        aux_save: None,
+        // Index definitions travel in the RDB before the keys, so they exist
+        // when the keys are loaded. This covers indexes with no local nodes.
+        aux_load: Some(aux_load),
+        aux_save: Some(aux_save),
         aux_save2: None,
-        aux_save_triggers: 0,
+        aux_save_triggers: raw::Aux::Before as c_int,
 
         free_effort: None,
         unlink: None,
@@ -357,12 +61,28 @@ pub static HNSW_NODE_REDIS_TYPE: RedisType = RedisType::new(
         copy2: None,
         free_effort2: None,
         mem_usage2: None,
-        unlink2: None,
+        // Called whenever a node leaves the keyspace: DEL, expiry, eviction,
+        // overwrite, and MIGRATE on the source shard.
+        unlink2: Some(unlink_node),
     },
 );
 
 unsafe extern "C" fn free_node(value: *mut c_void) {
     drop(unsafe { Box::from_raw(value as *mut NodeRedis) });
+}
+
+unsafe extern "C" fn mem_usage_node(value: *const c_void) -> usize {
+    let node = unsafe { &*(value as *const NodeRedis) };
+    std::mem::size_of::<NodeRedis>() + node.index.len() + node.data.len() * 4
+}
+
+unsafe extern "C" fn unlink_node(ctx: *mut raw::RedisModuleKeyOptCtx, value: *const c_void) {
+    let node = unsafe { &*(value as *const NodeRedis) };
+    let key = unsafe { raw::RedisModule_GetKeyNameFromOptCtx.unwrap()(ctx) };
+    let key = RedisString::string_as_slice(key as *mut _);
+    if let Ok(key) = std::str::from_utf8(key) {
+        crate::unindex_node(&node.index, key);
+    }
 }
 
 unsafe extern "C" fn load_node(rdb: *mut raw::RedisModuleIO, version: i32) -> *mut c_void {
@@ -376,32 +96,135 @@ unsafe extern "C" fn load_node(rdb: *mut raw::RedisModuleIO, version: i32) -> *m
 }
 
 fn read_node(rdb: *mut raw::RedisModuleIO) -> Option<NodeRedis> {
+    let index = load_str(rdb)?;
+    let params = load_params(rdb)?;
     let num_datum = load_usize(rdb)?;
     let data = (0..num_datum)
         .map(|_| raw::load_float(rdb).ok())
         .collect::<Option<Vec<f32>>>()?;
-
-    let num_layers = load_usize(rdb)?;
-    let neighbors = (0..num_layers)
-        .map(|_| load_str_vec(rdb))
-        .collect::<Option<Vec<Vec<String>>>>()?;
-
-    Some(NodeRedis { data, neighbors })
+    Some(NodeRedis {
+        index,
+        params,
+        data,
+    })
 }
 
 unsafe extern "C" fn save_node(rdb: *mut raw::RedisModuleIO, value: *mut c_void) {
     // Borrow only: Redis still owns the value after saving.
     let node = unsafe { &*(value as *const NodeRedis) };
 
+    raw::save_string(rdb, &node.index);
+    save_params(rdb, &node.params);
     raw::save_unsigned(rdb, node.data.len() as u64);
     for &datum in &node.data {
         raw::save_float(rdb, datum);
     }
+}
 
-    raw::save_unsigned(rdb, node.neighbors.len() as u64);
-    for layer in &node.neighbors {
-        save_str_vec(rdb, layer);
+/// AOF rewrite: recreate the index (idempotent) and the node.
+unsafe extern "C" fn rewrite_node(
+    aof: *mut raw::RedisModuleIO,
+    key: *mut raw::RedisModuleString,
+    value: *mut c_void,
+) {
+    let node = unsafe { &*(value as *const NodeRedis) };
+    let key = String::from_utf8_lossy(RedisString::string_as_slice(key)).into_owned();
+    let p = &node.params;
+    let mut new_args = vec![
+        node.index.clone(),
+        "DIM".into(),
+        p.dim.to_string(),
+        "M".into(),
+        p.m.to_string(),
+        "EFCON".into(),
+        p.ef_construction.to_string(),
+    ];
+    emit_aof(aof, "HNSW.NEW", &mut new_args);
+
+    let mut add_args = vec![
+        node.index.clone(),
+        key,
+        "DATA".into(),
+        node.data.len().to_string(),
+    ];
+    add_args.extend(node.data.iter().map(|d| d.to_string()));
+    emit_aof(aof, "HNSW.NODE.ADD", &mut add_args);
+}
+
+fn emit_aof(aof: *mut raw::RedisModuleIO, cmd: &str, args: &mut [String]) {
+    let strings: Vec<RedisString> = args
+        .iter()
+        .map(|a| RedisString::create(None, a.as_str()))
+        .collect();
+    let mut argv: Vec<*mut raw::RedisModuleString> = strings.iter().map(|s| s.inner).collect();
+    let cmd = CString::new(cmd).unwrap();
+    // "v": an array of RedisModuleString pointers followed by its length.
+    unsafe {
+        raw::RedisModule_EmitAOF.unwrap()(
+            aof,
+            cmd.as_ptr(),
+            c"v".as_ptr(),
+            argv.as_mut_ptr(),
+            argv.len(),
+        );
     }
+}
+
+unsafe extern "C" fn aux_save(rdb: *mut raw::RedisModuleIO, when: c_int) {
+    if when != raw::Aux::Before as c_int {
+        return;
+    }
+    let defs = crate::index_definitions();
+    raw::save_unsigned(rdb, defs.len() as u64);
+    for (name, params) in &defs {
+        raw::save_string(rdb, name);
+        save_params(rdb, params);
+    }
+}
+
+unsafe extern "C" fn aux_load(rdb: *mut raw::RedisModuleIO, encver: c_int, when: c_int) -> c_int {
+    if encver != NODE_VERSION {
+        return raw::Status::Err as c_int;
+    }
+    if when != raw::Aux::Before as c_int {
+        return raw::Status::Ok as c_int;
+    }
+    let read = || -> Option<Vec<(String, IndexParams)>> {
+        let n = load_usize(rdb)?;
+        (0..n)
+            .map(|_| Some((load_str(rdb)?, load_params(rdb)?)))
+            .collect()
+    };
+    match read() {
+        Some(defs) => {
+            crate::define_indices(defs);
+            raw::Status::Ok as c_int
+        }
+        None => raw::Status::Err as c_int,
+    }
+}
+
+fn save_params(rdb: *mut raw::RedisModuleIO, p: &IndexParams) {
+    raw::save_unsigned(rdb, p.dim as u64);
+    raw::save_unsigned(rdb, p.m as u64);
+    raw::save_unsigned(rdb, p.ef_construction as u64);
+}
+
+fn load_params(rdb: *mut raw::RedisModuleIO) -> Option<IndexParams> {
+    Some(IndexParams {
+        dim: load_usize(rdb)?,
+        m: load_usize(rdb)?,
+        ef_construction: load_usize(rdb)?,
+    })
+}
+
+fn load_usize(rdb: *mut raw::RedisModuleIO) -> Option<usize> {
+    raw::load_unsigned(rdb).ok()?.try_into().ok()
+}
+
+fn load_str(rdb: *mut raw::RedisModuleIO) -> Option<String> {
+    let s = raw::load_string(rdb).ok()?;
+    s.try_as_str().ok().map(str::to_owned)
 }
 
 #[derive(Default)]

@@ -12,6 +12,7 @@
 
 - [Getting Started](#getting-started)
     - [Redis commands](#redis-commands)
+- [Redis Cluster](#redis-cluster)
 - [Command Reference](#command-reference)
     - [HNSW.NEW](#hnswnew)
     - [HNSW.GET](#hnswget)
@@ -36,11 +37,49 @@ Load the module - `redis-server --loadmodule ./target/<build_mode>/libredis_hnsw
 <a id="markdown-redis-commands" name="redis-commands"></a>
 Creating a new index - `hnsw.new {index_name} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]`
 
-Add nodes - `hnsw.node.add {index_name} {node_name} [DATA {dim} {...data}]`
+Add nodes - `hnsw.node.add {index_name} {key} [DATA {dim} {...data}]`
 
-Delete nodes - `hnsw.node.del {index_name} {node_name}`
+Delete nodes - `hnsw.node.del {index_name} {key}` (or plain `DEL {key}`)
 
-Search KNN - `hnsw.search {index_name} [K {k}] [DATA {dim} {...data}]`
+Search KNN - `hnsw.search {index_name} [K {k}] [QUERY {dim} {...data}]`
+
+Each node is an ordinary Redis key that you name. The HNSW graph is kept in memory and is not stored in keys. The module keeps it in step with the keyspace, so `DEL`, `EXPIRE`, eviction, `RENAME` and overwrites all update the index. The graph is rebuilt from the vectors when the server loads an RDB or AOF.
+
+> **Upgrading from 0.2:** the on-disk format changed. 0.2 stored index and graph keys, and 0.3 cannot load them. Re-add your vectors after upgrading.
+
+## Redis Cluster
+<a id="markdown-redis-cluster" name="redis-cluster"></a>
+
+Every shard keeps its own HNSW graph over the vectors it stores. A cluster-wide search sends the query to every primary and merges the per-shard top-k results.
+
+* **Node commands are routed by key.** `HNSW.NODE.ADD/GET/DEL` declare `{key}` as their key, so the cluster sends them to the shard that owns it. Vectors spread across shards like any other keys. Use a hash tag in the key (`doc:{42}:vec`) to keep a vector next to related data.
+* **Index commands are per shard.** `HNSW.NEW`, `HNSW.DEL`, `HNSW.GET` and `HNSW.SEARCH` are keyless and act only on the node that receives them. Send `HNSW.NEW` and `HNSW.DEL` to every primary. `HNSW.NEW` is idempotent when the parameters match, so you can re-send it after adding a shard. Each node also carries its index's parameters, so a shard that receives vectors through slot migration defines the index by itself.
+* **Search fans out.** Send `HNSW.SEARCH` to every primary, or to replicas after `READONLY`. Merge the results by similarity and keep the top K. A key can briefly appear on two shards during a migration, so dedupe by name.
+* **Slot migration, replication and persistence need nothing extra.** `MIGRATE` removes nodes from the source graph and adds them to the target graph. Replicas build their own graphs from the replication stream. Index definitions are saved in the RDB, so they survive restarts even when a shard holds no nodes.
+
+[`client/hnsw_cluster.py`](client/hnsw_cluster.py) is a reference coordinator built on redis-py. It broadcasts index commands, routes node commands, and runs the fan-out search:
+
+```python
+from redis.cluster import RedisCluster
+from hnsw_cluster import HnswCluster
+
+hc = HnswCluster(RedisCluster(host="127.0.0.1", port=7000))
+hc.create_index("docs", dim=3)
+hc.add("docs", "doc:1:vec", [0.1, 0.2, 0.3])
+hc.search("docs", [0.1, 0.2, 0.3], k=5)   # [("doc:1:vec", -0.0), ...]
+```
+
+To run the end-to-end test against a local 3-primary, 3-replica cluster:
+
+```bash
+cargo build && scripts/cluster.sh start 3 1 && python client/test_cluster.py; scripts/cluster.sh stop
+```
+
+**Limitations**
+
+* `COPY` and `MOVE` of node keys are not supported. The graph is per server, not per database.
+* Recall depends on each shard's own graph. Each shard searches with `ef = max(EFCON, K)`.
+* `FLUSHALL`/`FLUSHDB` drop index definitions as well as nodes.
 
 
 ## Command Reference
@@ -53,7 +92,7 @@ Search KNN - `hnsw.search {index_name} [K {k}] [DATA {dim} {...data}]`
 HNSW.NEW {index} [DIM {data_dim}] [M {m}] [EFCON {ef_construction}]
 ```
 #### Description
-Creates an HNSW index 
+Creates an HNSW index on the receiving node. Repeating it with the same parameters is a no-op. In a cluster, send it to every primary.
 #### Example
 ```
 HNSW.NEW foo DIM 128 M 5 EFCON 200
@@ -75,7 +114,7 @@ OK or an error
 HNSW.GET {index}
 ```
 #### Description
-Retrieves an HNSW index 
+Retrieves an HNSW index as seen by the receiving node. `node_count` counts that node's vectors only.
 #### Example
 ```
 HNSW.GET foo
@@ -94,7 +133,7 @@ O(1)
 HNSW.DEL {index}
 ```
 #### Description
-Deletes an HNSW index 
+Deletes an HNSW index and all of its node keys on the receiving node. In a cluster, send it to every primary.
 #### Example
 ```
 HNSW.DEL foo
@@ -102,7 +141,7 @@ HNSW.DEL foo
 #### Parameters
 * **index**: required, name of the index.
 #### Complexity
-O(1)
+O(n) where n is the number of local nodes in the index
 #### Returns
 OK or an error
 
@@ -110,17 +149,17 @@ OK or an error
 <a id="markdown-hnsw.node.add" name="hnsw.node.add"></a>
 #### Format
 ```
-HNSW.NODE.ADD {index} {node} [DATA {dim} {...data}]
+HNSW.NODE.ADD {index} {key} [DATA {dim} {...data}]
 ```
 #### Description
-Adds an element to the index 
+Stores a vector at `key` and adds it to the index. If `key` already holds a vector, the vector is replaced. If `key` holds another type, the command returns an error.
 #### Example
 ```
 HNSW.NODE.ADD foo bar DATA 4 1.0 1.0 1.0 1.0
 ```
 #### Parameters
 * **index**: required, name of the index
-* **node**: required, name of the new node
+* **key**: required, the key that stores the node. It also determines the cluster slot.
 * **DATA**: required, dimensionality followed by a space separated vector of data. Total entries must match `DIM` of index
 #### Complexity
 O(log(n)) where n is the number of nodes in the index
@@ -131,17 +170,17 @@ OK or an error
 <a id="markdown-hnsw.node.get" name="hnsw.node.get"></a>
 #### Format
 ```
-HNSW.NODE.GET {index} {node}
+HNSW.NODE.GET {index} {key}
 ```
 #### Description
-Retrieves an element from the index 
+Retrieves an element from the index: its data and its links in the local graph
 #### Example
 ```
 HNSW.NODE.GET foo bar
 ```
 #### Parameters
 * **index**: required, name of the index
-* **node**: required, name of the node
+* **key**: required, the key that stores the node
 #### Complexity
 O(1)
 #### Returns
@@ -151,17 +190,17 @@ O(1)
 <a id="markdown-hnsw.node.del" name="hnsw.node.del"></a>
 #### Format
 ```
-HNSW.NODE.DEL {index} {node}
+HNSW.NODE.DEL {index} {key}
 ```
 #### Description
-Removes an element from the index 
+Deletes the node key and removes it from the index. A plain `DEL {key}` does the same.
 #### Example
 ```
 HNSW.NODE.DEL foo bar
 ```
 #### Parameters
 * **index**: required, name of the index
-* **node**: required, name of the node
+* **key**: required, the key that stores the node
 #### Complexity
 O(log(n)) where n is the number of nodes in the index
 #### Returns
@@ -174,7 +213,7 @@ OK or an error
 HNSW.SEARCH {index} [K {k}] [QUERY {dim} {...data}]
 ```
 #### Description
-Search the index for the K nearest elements to the query
+Searches the receiving node's part of the index for the K nearest elements to the query. In a cluster, send it to every primary and merge the results (see [Redis Cluster](#redis-cluster)).
 #### Example
 ```
 HNSW.SEARCH foo K 5 QUERY 4 0.0 0.0 0.0 0.0
@@ -182,7 +221,7 @@ HNSW.SEARCH foo K 5 QUERY 4 0.0 0.0 0.0 0.0
 #### Parameters
 * **index**: required, name of the index
 * **K**: required, number of nearest neighbors to return
-* **DATA**: required, dimensionality followed by space separated vector of query data. Total entries must match `DIM` of index
+* **QUERY**: required, dimensionality followed by space separated vector of query data. Total entries must match `DIM` of index
 #### Complexity
 O(log(n)) where n is the number of nodes in the index
 #### Returns

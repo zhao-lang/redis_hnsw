@@ -452,27 +452,6 @@ where
         Ok(self.search_knn_internal(data, k, self.ef_construction.max(k)))
     }
 
-    /// Recompute every node's `in_neighbors` from the outgoing links. Call
-    /// after building the graph from storage.
-    pub fn rebuild_in_neighbors(&self) {
-        for n in self.nodes.values() {
-            n.write().in_neighbors.clear();
-        }
-        for n in self.nodes.values() {
-            let outs: Vec<Vec<Node<T>>> = (0..n.read().neighbors.len())
-                .map(|lc| n.links(lc))
-                .collect();
-            let src = n.downgrade();
-            for (lc, layer) in outs.iter().enumerate() {
-                for y in layer {
-                    let mut w = y.write();
-                    ensure_level(&mut w.in_neighbors, lc);
-                    push_unique(&mut w.in_neighbors[lc], src.clone());
-                }
-            }
-        }
-    }
-
     fn max_conn(&self, lc: usize) -> usize {
         if lc == 0 { self.m_max_0 } else { self.m_max }
     }

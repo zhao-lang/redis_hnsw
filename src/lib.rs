@@ -1,58 +1,219 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+//! HNSW for Redis, cluster-ready.
+//!
+//! Vectors are ordinary keys of the `hnswnodet` type, named by the client and
+//! routed by Redis Cluster like any other key. Each shard keeps an in-memory
+//! HNSW graph per index over the vectors it currently holds. The graph is
+//! derived state: it follows the keyspace through keyspace events (writes,
+//! RESTORE from slot migration, RDB load) and the type's unlink callback (DEL,
+//! expiry, eviction, overwrite, MIGRATE away), and it is never stored in keys.
+//!
+//! `HNSW.SEARCH` searches the local graph only. To search a whole cluster, send
+//! it to every primary and merge the top-k (see `client/hnsw_cluster.py`).
+//! Index definitions (`HNSW.NEW` / `HNSW.DEL`) are per shard and must be sent
+//! to every primary too.
+
 mod hnsw;
 mod types;
 
-use hnsw::{Index, Node};
+use hnsw::Index;
 use redis_module::{
-    Context, RedisError, RedisResult, RedisString, RedisValue, key::RedisKey,
-    key::RedisKeyWritable, redis_module,
+    Context, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status, logging, raw,
+    redis_module,
 };
 use redismodule_cmd::{ArgType, Collection, Command, command, rediscmd_doc};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, TryLockError};
 use types::*;
-
-static PREFIX: &str = "hnsw";
-
-/// Key holding the index. The index name is a hash tag, so the index and all
-/// of its nodes live in one cluster slot: the slot of the bare index name,
-/// which is what the commands declare as their key (argv[1]).
-fn index_key(index: &str) -> Result<String, RedisError> {
-    if index.contains(['{', '}']) {
-        return Err(err("Index name must not contain '{' or '}'"));
-    }
-    Ok(format!("{}:{{{}}}", PREFIX, index))
-}
-
-fn node_key(index: &str, node: &str) -> Result<String, RedisError> {
-    Ok(format!("{}:{}", index_key(index)?, node))
-}
 
 fn err(msg: impl Into<String>) -> RedisError {
     RedisError::String(msg.into())
 }
 
-fn open_key(ctx: &Context, name: &str) -> RedisKey {
-    ctx.open_key(&ctx.create_string(name))
-}
-
-fn open_key_writable(ctx: &Context, name: &str) -> RedisKeyWritable {
-    ctx.open_key_writable(&ctx.create_string(name))
-}
-
-type IndexArc = Arc<RwLock<IndexT>>;
 type IndexT = Index<f32, f32>;
 
-static INDICES: LazyLock<RwLock<HashMap<String, IndexArc>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Shard-local indices by name.
+///
+/// Only the Redis main thread touches this (and a forked RDB child, which has
+/// its own copy). Keyspace callbacks can fire while a command runs, so the code
+/// never holds the lock across a keyspace write or key open; `indices()` turns
+/// any re-entry into an error rather than a deadlock.
+static INDICES: LazyLock<Mutex<HashMap<String, IndexT>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn indices() -> Result<MutexGuard<'static, HashMap<String, IndexT>>, RedisError> {
+    match INDICES.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::Poisoned(p)) => Ok(p.into_inner()),
+        Err(TryLockError::WouldBlock) => Err(err("hnsw: re-entrant access to the index registry")),
+    }
+}
+
+fn new_graph(name: &str, p: &IndexParams) -> IndexT {
+    Index::new(
+        name,
+        Box::new(hnsw::metrics::euclidean),
+        p.dim,
+        p.m,
+        p.ef_construction,
+    )
+}
+
+fn params_of(index: &IndexT) -> IndexParams {
+    IndexParams {
+        dim: index.data_dim,
+        m: index.m,
+        ef_construction: index.ef_construction,
+    }
+}
+
+/// Definitions of all local indices, for RDB aux save.
+pub(crate) fn index_definitions() -> Vec<(String, IndexParams)> {
+    match indices() {
+        Ok(indices) => indices
+            .iter()
+            .map(|(name, index)| (name.clone(), params_of(index)))
+            .collect(),
+        Err(e) => {
+            logging::log_warning(format!("{e}: index definitions not saved"));
+            Vec::new()
+        }
+    }
+}
+
+/// Define indices loaded from RDB aux data, keeping any that already exist.
+pub(crate) fn define_indices(defs: Vec<(String, IndexParams)>) {
+    let Ok(mut indices) = indices() else { return };
+    for (name, params) in defs {
+        indices
+            .entry(name.clone())
+            .or_insert_with(|| new_graph(&name, &params));
+    }
+}
+
+/// Remove `key` from the graph of `index`. Called when a node leaves the
+/// keyspace.
+pub(crate) fn unindex_node(index: &str, key: &str) {
+    let mut indices = match indices() {
+        Ok(i) => i,
+        Err(e) => return logging::log_warning(format!("{e}: {key} not removed from {index}")),
+    };
+    if let Some(graph) = indices.get_mut(index)
+        && graph.nodes.contains_key(key)
+    {
+        let _ = graph.delete_node(key, |_, _| {});
+    }
+}
+
+/// Make the graphs agree with the current value of `key`.
+fn reconcile(ctx: &Context, key: &str) {
+    // Read before locking: opening a key can expire it, which re-enters
+    // through the unlink callback.
+    let value = ctx
+        .open_key(&ctx.create_string(key))
+        .get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)
+        .ok()
+        .flatten()
+        .cloned();
+
+    let mut indices = match indices() {
+        Ok(i) => i,
+        Err(e) => return ctx.log_warning(&format!("{e}: {key} not reconciled")),
+    };
+
+    // Drop the key from any graph it no longer belongs to. The unlink callback
+    // normally does this already; this is the fallback.
+    for (name, graph) in indices.iter_mut() {
+        let stale = match (&value, graph.nodes.get(key)) {
+            (_, None) => false,
+            (Some(v), Some(n)) => v.index != *name || n.read().data != v.data,
+            (None, Some(_)) => true,
+        };
+        if stale {
+            let _ = graph.delete_node(key, |_, _| {});
+        }
+    }
+
+    let Some(node) = value else { return };
+    let graph = match indices.entry(node.index.clone()) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => {
+            // A node arrived (slot migration, replication) before HNSW.NEW
+            // reached this shard: its parameters define the index.
+            ctx.log_notice(&format!("defining index {} from {}", node.index, key));
+            v.insert(new_graph(&node.index, &node.params))
+        }
+    };
+    if params_of(graph) != node.params {
+        return ctx.log_warning(&format!(
+            "{} was written with parameters {:?} but index {} has {:?}; not indexed",
+            key,
+            node.params,
+            node.index,
+            params_of(graph)
+        ));
+    }
+    if !graph.nodes.contains_key(key)
+        && let Err(e) = graph.add_node(key, &node.data, |_, _| {})
+    {
+        ctx.log_warning(&format!("{key} not indexed: {}", e.error_string()));
+    }
+}
+
+fn on_key_event(ctx: &Context, _class: NotifyEvent, _event: &str, key: &[u8]) {
+    if let Ok(key) = std::str::from_utf8(key) {
+        reconcile(ctx, key);
+    }
+}
+
+/// FLUSHALL/FLUSHDB and the start of a load replace the whole dataset, so the
+/// graphs and definitions start over. A load brings its definitions back from
+/// the RDB aux data before any key.
+extern "C" fn on_reset(
+    _ctx: *mut raw::RedisModuleCtx,
+    eid: raw::RedisModuleEvent,
+    subevent: u64,
+    _data: *mut std::os::raw::c_void,
+) {
+    let reset = match eid.id {
+        raw::REDISMODULE_EVENT_FLUSHDB => subevent == raw::REDISMODULE_SUBEVENT_FLUSHDB_START,
+        raw::REDISMODULE_EVENT_LOADING => matches!(
+            subevent,
+            raw::REDISMODULE_SUBEVENT_LOADING_RDB_START
+                | raw::REDISMODULE_SUBEVENT_LOADING_AOF_START
+                | raw::REDISMODULE_SUBEVENT_LOADING_REPL_START
+        ),
+        _ => false,
+    };
+    if reset && let Ok(mut indices) = indices() {
+        indices.clear();
+    }
+}
+
+fn init(ctx: &Context, _args: &[RedisString]) -> Status {
+    for id in [
+        raw::REDISMODULE_EVENT_FLUSHDB,
+        raw::REDISMODULE_EVENT_LOADING,
+    ] {
+        let event = raw::RedisModuleEvent { id, dataver: 1 };
+        let res = unsafe {
+            raw::RedisModule_SubscribeToServerEvent.unwrap()(ctx.ctx, event, Some(on_reset))
+        };
+        if res != raw::REDISMODULE_OK as i32 {
+            ctx.log_warning("failed to subscribe to server events");
+            return Status::Err;
+        }
+    }
+    Status::Ok
+}
 
 thread_local! {
     #[rediscmd_doc(clean)]
     static NEW_INDEX_CMD: Command = command!{
         name: "hnsw.new",
-        desc: "Create a new HNSW index.",
+        desc: "Create an HNSW index on this shard. Idempotent when the parameters match. In a cluster, send it to every primary.",
         args: [
             ["name", "Name of the index.", ArgType::Arg, String, Collection::Unit, None],
             ["dim", "Dimensionality of the data.", ArgType::Kwarg, u64, Collection::Unit, None],
@@ -72,7 +233,7 @@ thread_local! {
     #[rediscmd_doc]
     static GET_INDEX_CMD: Command = command!{
         name: "hnsw.get",
-        desc: "Retrieve an HNSW index.",
+        desc: "Retrieve an HNSW index as seen by this shard (node_count is local).",
         args: [
             ["name", "Name of the index.", ArgType::Arg, String, Collection::Unit, None],
         ],
@@ -81,7 +242,7 @@ thread_local! {
     #[rediscmd_doc]
     static DEL_INDEX_CMD: Command = command!{
         name: "hnsw.del",
-        desc: "Delete an HNSW index.",
+        desc: "Delete an HNSW index and its nodes on this shard. In a cluster, send it to every primary.",
         args: [
             ["name", "Name of the index.", ArgType::Arg, String, Collection::Unit, None],
         ],
@@ -90,10 +251,10 @@ thread_local! {
     #[rediscmd_doc]
     static ADD_NODE_CMD: Command = command!{
         name: "hnsw.node.add",
-        desc: "Add a node to the index.",
+        desc: "Add a node to the index, or replace it. The node is stored at `key`.",
         args: [
             ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
-            ["node", "name of the node", ArgType::Arg, String, Collection::Unit, None],
+            ["key", "key that stores the node; it decides the cluster slot", ArgType::Arg, String, Collection::Unit, None],
             [
                 "data",
                 "Dimensionality followed by a space separated vector of data. Total entries must match `DIM` of index",
@@ -108,24 +269,24 @@ thread_local! {
         desc: "Retrieve a node from the index.",
         args: [
             ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
-            ["node", "name of the node", ArgType::Arg, String, Collection::Unit, None],
+            ["key", "key that stores the node", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
     #[rediscmd_doc]
     static DEL_NODE_CMD: Command = command!{
         name: "hnsw.node.del",
-        desc: "Delete a node from the index.",
+        desc: "Delete a node from the index. Plain DEL on the key works too.",
         args: [
             ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
-            ["node", "name of the node", ArgType::Arg, String, Collection::Unit, None],
+            ["key", "key that stores the node", ArgType::Arg, String, Collection::Unit, None],
         ],
     };
 
     #[rediscmd_doc]
     static SEARCH_CMD: Command = command!{
         name: "hnsw.search",
-        desc: "Search the index for the K nearest elements to the query.",
+        desc: "Search this shard's part of the index for the K nearest elements to the query. In a cluster, send it to every primary and merge the results.",
         args: [
             ["index", "name of the index", ArgType::Arg, String, Collection::Unit, None],
             [
@@ -142,377 +303,243 @@ thread_local! {
     };
 }
 
-fn new_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    ctx.auto_memory();
+fn no_index(name: &str) -> RedisError {
+    err(format!("Index: {} does not exist", name))
+}
 
+fn no_node(index: &str, key: &str) -> RedisError {
+    err(format!("Node: {} does not exist in Index: {}", key, index))
+}
+
+fn new_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut parsed = NEW_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
-    let name_suffix = parsed.remove("name").unwrap().as_string()?;
-    let index_name = index_key(&name_suffix)?;
-    let data_dim = parsed.remove("dim").unwrap().as_u64()? as usize;
-    let m = parsed.remove("m").unwrap().as_u64()? as usize;
-    let ef_construction = parsed.remove("efcon").unwrap().as_u64()? as usize;
+    let name = parsed.remove("name").unwrap().as_string()?;
+    let params = IndexParams {
+        dim: parsed.remove("dim").unwrap().as_u64()? as usize,
+        m: parsed.remove("m").unwrap().as_u64()? as usize,
+        ef_construction: parsed.remove("efcon").unwrap().as_u64()? as usize,
+    };
+    if params.dim == 0 {
+        return Err(RedisError::Str("DIM must be at least 1"));
+    }
     // mL = 1/ln(M) is undefined for M < 2
-    if m < 2 {
+    if params.m < 2 {
         return Err(RedisError::Str("M must be at least 2"));
     }
 
-    // write to redis
-    let key = open_key_writable(ctx, &index_name);
-    match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
-        Some(_) => {
-            return Err(RedisError::String(format!(
-                "Index: {} already exists",
-                index_name
+    let mut indices = indices()?;
+    match indices.entry(name.clone()) {
+        Entry::Occupied(o) if params_of(o.get()) != params => {
+            return Err(err(format!(
+                "Index: {} already exists with different parameters",
+                name
             )));
         }
-        None => {
-            // create index
-            let index = Index::new(
-                &index_name,
-                Box::new(hnsw::metrics::euclidean),
-                data_dim,
-                m,
-                ef_construction,
-            );
-            ctx.log_debug(format!("{:?}", index).as_str());
-            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, index.clone().into())?;
-            // Add index to global hashmap
-            INDICES
-                .write()
-                .unwrap()
-                .insert(index_name, Arc::new(RwLock::new(index)));
+        Entry::Occupied(_) => {}
+        Entry::Vacant(v) => {
+            v.insert(new_graph(&name, &params));
         }
     }
+    drop(indices);
 
     ctx.replicate_verbatim();
     Ok("OK".into())
 }
 
-fn get_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    ctx.auto_memory();
-
+fn get_index(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut parsed = GET_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
+    let name = parsed.remove("name").unwrap().as_string()?;
 
-    let name_suffix = parsed.remove("name").unwrap().as_string()?;
-    let index_name = index_key(&name_suffix)?;
-
-    let index = load_index(ctx, &index_name)?;
-    let index = index.try_read().map_err(|e| err(e.to_string()))?;
-    ctx.log_debug(format!("Index: {:?}", index).as_str());
-    ctx.log_debug(format!("Layers: {:?}", index.layers.len()).as_str());
-    ctx.log_debug(format!("Nodes: {:?}", index.nodes.len()).as_str());
-
-    let index_redis: IndexRedis = index.clone().into();
-
-    Ok(index_redis.into())
+    let indices = indices()?;
+    let index = indices.get(&name).ok_or_else(|| no_index(&name))?;
+    let enterpoint: Option<String> = index
+        .enterpoint
+        .as_ref()
+        .map(|ep| ep.upgrade().read().name.clone());
+    let reply: Vec<RedisValue> = vec![
+        "name".into(),
+        index.name.as_str().into(),
+        "metric".into(),
+        format!("{:?}", index.mfunc_kind).into(),
+        "data_dim".into(),
+        index.data_dim.into(),
+        "m".into(),
+        index.m.into(),
+        "ef_construction".into(),
+        index.ef_construction.into(),
+        "level_mult".into(),
+        index.level_mult.into(),
+        "node_count".into(),
+        index.node_count.into(),
+        "max_layer".into(),
+        index.max_layer.into(),
+        "enterpoint".into(),
+        enterpoint.into(),
+    ];
+    Ok(reply.into())
 }
 
 fn delete_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    ctx.auto_memory();
-
     let mut parsed = DEL_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
+    let name = parsed.remove("name").unwrap().as_string()?;
 
-    let name_suffix = parsed.remove("name").unwrap().as_string()?;
-    let index_name = index_key(&name_suffix)?;
+    // Drop the graph first and release the lock: deleting the keys below
+    // re-enters through the unlink callback, which then finds nothing to do.
+    let graph = indices()?.remove(&name).ok_or_else(|| no_index(&name))?;
 
-    // get index from global hashmap
-    load_index(ctx, &index_name)?;
-    let mut indices = INDICES.write().unwrap();
-    let index = indices
-        .remove(&index_name)
-        .ok_or_else(|| err(format!("Index: {} does not exist", name_suffix)))?;
-    let index = index.try_read().map_err(|e| err(e.to_string()))?;
-
-    for node_name in index.nodes.keys() {
-        delete_node_redis(ctx, node_name)?;
-    }
-
-    // get index from redis
-    ctx.log_debug(format!("deleting index: {}", index_name).as_str());
-    let rkey = open_key_writable(ctx, &index_name);
-
-    match rkey.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
-        Some(_) => rkey.delete()?,
-        None => {
-            return Err(RedisError::String(format!(
-                "Index: {} does not exist",
-                name_suffix
-            )));
+    for key_name in graph.nodes.keys() {
+        let key_name = ctx.create_string(key_name.as_str());
+        let key = ctx.open_key_writable(&key_name);
+        let ours = matches!(
+            key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE),
+            Ok(Some(node)) if node.index == name
+        );
+        if ours {
+            key.delete()?;
+            ctx.notify_keyspace_event(NotifyEvent::GENERIC, "del", &key_name);
         }
-    };
+    }
 
     ctx.replicate_verbatim();
     Ok(1_usize.into())
 }
 
-fn load_index(ctx: &Context, index_name: &str) -> Result<IndexArc, RedisError> {
-    let mut indices = INDICES.write().unwrap();
-    // check if index is in global hashmap
-    let index = match indices.entry(index_name.to_string()) {
-        Entry::Occupied(o) => o.into_mut(),
-        // if index isn't present, load it from redis
-        Entry::Vacant(v) => {
-            // get index from redis
-            ctx.log_debug(format!("get key: {}", index_name).as_str());
-            let rkey = open_key(ctx, index_name);
-
-            let index_redis = rkey
-                .get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)?
-                .ok_or_else(|| err(format!("Index: {} does not exist", index_name)))?;
-
-            let index = make_index(ctx, index_redis)?;
-            v.insert(Arc::new(RwLock::new(index)))
-        }
-    };
-
-    Ok(index.clone())
-}
-
-fn make_index(ctx: &Context, ir: &IndexRedis) -> Result<IndexT, RedisError> {
-    let mut index: IndexT = ir.clone().into();
-
-    index.nodes = HashMap::with_capacity(ir.node_count);
-    for node_name in &ir.nodes {
-        let key = open_key(ctx, node_name);
-
-        let nr = key
-            .get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)?
-            .ok_or_else(|| err(format!("Node: {} does not exist", node_name)))?;
-
-        let node = Node::new(node_name, &nr.data, index.m_max_0);
-        index.nodes.insert(node_name.to_owned(), node);
-    }
-
-    // reconstruct nodes
-    for node_name in &ir.nodes {
-        let target = index.nodes.get(node_name).unwrap();
-
-        let key = open_key(ctx, node_name);
-
-        let nr = key
-            .get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)?
-            .ok_or_else(|| err(format!("Node: {} does not exist", node_name)))?;
-        for layer in &nr.neighbors {
-            let mut node_layer = Vec::with_capacity(layer.len());
-            for neighbor in layer {
-                let nn = index
-                    .nodes
-                    .get(neighbor)
-                    .ok_or_else(|| err(format!("Node: {} does not exist", neighbor)))?;
-                node_layer.push(nn.downgrade());
-            }
-            target.write().neighbors.push(node_layer);
-        }
-    }
-
-    // reconstruct layers
-    for layer in &ir.layers {
-        let mut node_layer = HashSet::with_capacity(layer.len());
-        for node_name in layer {
-            let node = index
-                .nodes
-                .get(node_name)
-                .ok_or_else(|| err(format!("Node: {} does not exist", node_name)))?;
-            node_layer.insert(node.downgrade());
-        }
-        index.layers.push(node_layer);
-    }
-
-    // set enterpoint
-    index.enterpoint = match &ir.enterpoint {
-        Some(node_name) => {
-            let node = index
-                .nodes
-                .get(node_name)
-                .ok_or_else(|| err(format!("Node: {} does not exist", node_name)))?;
-            Some(node.downgrade())
-        }
-        None => None,
-    };
-
-    index.rebuild_in_neighbors();
-
-    Ok(index)
-}
-
-fn update_index(ctx: &Context, index_name: &str, index: &IndexT) -> Result<(), RedisError> {
-    let key = open_key_writable(ctx, index_name);
-    match key.get_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE)? {
-        Some(_) => {
-            ctx.log_debug(format!("update index: {}", index_name).as_str());
-            key.set_value::<IndexRedis>(&HNSW_INDEX_REDIS_TYPE, index.clone().into())?;
-        }
-        None => {
-            return Err(RedisError::String(format!(
-                "Index: {} does not exist",
-                index_name
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn add_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    ctx.auto_memory();
-
     let mut parsed = ADD_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
 
-    let index_suffix = parsed.remove("index").unwrap().as_string()?;
-    let node_suffix = parsed.remove("node").unwrap().as_string()?;
+    let index = parsed.remove("index").unwrap().as_string()?;
+    let key_name = parsed.remove("key").unwrap().as_string()?;
+    let data = parsed
+        .remove("data")
+        .unwrap()
+        .as_f64vec()?
+        .iter()
+        .map(|d| *d as f32)
+        .collect::<Vec<f32>>();
 
-    let index_name = index_key(&index_suffix)?;
-    let node_name = node_key(&index_suffix, &node_suffix)?;
-
-    let dataf64 = parsed.remove("data").unwrap().as_f64vec()?;
-    let data = dataf64.iter().map(|d| *d as f32).collect::<Vec<f32>>();
-
-    let index = load_index(ctx, &index_name)?;
-    let mut index = index.try_write().map_err(|e| err(e.to_string()))?;
-
-    let up = |name: String, node: Node<f32>| {
-        write_node(ctx, &name, (&node).into()).unwrap();
+    let params = {
+        let indices = indices()?;
+        let graph = indices.get(&index).ok_or_else(|| no_index(&index))?;
+        params_of(graph)
     };
+    if data.len() != params.dim {
+        return Err(err(format!(
+            "data dimension: {} does not match Index",
+            data.len()
+        )));
+    }
 
-    ctx.log_debug(format!("Adding node: {} to Index: {}", node_name, index_name).as_str());
-    index
-        .add_node(&node_name, &data, up)
-        .map_err(|e| err(e.error_string()))?;
-
-    // write node to redis
-    let node = index.nodes.get(&node_name).unwrap();
-    write_node(ctx, &node_name, node.into())?;
-
-    // update index in redis
-    update_index(ctx, &index_name, &index)?;
+    let key_name = ctx.create_string(key_name.as_str());
+    let key = ctx.open_key_writable(&key_name);
+    // Errors on a key of another type instead of overwriting it.
+    key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)?;
+    key.set_value(
+        &HNSW_NODE_REDIS_TYPE,
+        NodeRedis {
+            index,
+            params,
+            data,
+        },
+    )?;
+    // Indexing happens in the keyspace event handler, the same path that
+    // picks up keys arriving through RESTORE or RDB load.
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, "hnsw.node.add", &key_name);
 
     ctx.replicate_verbatim();
     Ok("OK".into())
 }
 
-fn delete_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    ctx.auto_memory();
+fn get_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+    let mut parsed = GET_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
+    let index = parsed.remove("index").unwrap().as_string()?;
+    let key_name = parsed.remove("key").unwrap().as_string()?;
 
-    let mut parsed = DEL_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
-
-    let index_suffix = parsed.remove("index").unwrap().as_string()?;
-    let node_suffix = parsed.remove("node").unwrap().as_string()?;
-
-    let index_name = index_key(&index_suffix)?;
-    let node_name = node_key(&index_suffix, &node_suffix)?;
-
-    let index = load_index(ctx, &index_name)?;
-    let mut index = index.try_write().map_err(|e| err(e.to_string()))?;
-
-    let node = index
-        .nodes
-        .get(&node_name)
-        .ok_or_else(|| err(format!("Node: {} does not exist", node_name)))?;
-    if Arc::strong_count(&node.0) > 1 {
-        return Err(err(format!(
-            "{} is being accessed, unable to delete. Try again later",
-            node_name
-        )));
-    }
-
-    let up = |name: String, node: Node<f32>| {
-        write_node(ctx, &name, (&node).into()).unwrap();
+    let key = ctx.open_key(&ctx.create_string(key_name.as_str()));
+    let node = match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
+        Some(node) if node.index == index => node.clone(),
+        _ => return Err(no_node(&index, &key_name)),
     };
 
-    index
-        .delete_node(&node_name, up)
-        .map_err(|e| err(e.error_string()))?;
+    // Links in this shard's graph, per layer.
+    let neighbors: Vec<RedisValue> = indices()?
+        .get(&index)
+        .and_then(|g| g.nodes.get(&key_name))
+        .map(|n| {
+            n.read()
+                .neighbors
+                .iter()
+                .map(|layer| {
+                    layer
+                        .iter()
+                        .map(|w| w.upgrade().read().name.as_str().into())
+                        .collect::<Vec<RedisValue>>()
+                        .into()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-    delete_node_redis(ctx, &node_name)?;
+    let reply: Vec<RedisValue> = vec![
+        "index".into(),
+        node.index.as_str().into(),
+        "data".into(),
+        node.data
+            .iter()
+            .map(|x| *x as f64)
+            .collect::<Vec<f64>>()
+            .into(),
+        "neighbors".into(),
+        neighbors.into(),
+    ];
+    Ok(reply.into())
+}
 
-    // update index in redis
-    update_index(ctx, &index_name, &index)?;
+fn delete_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+    let mut parsed = DEL_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
+    let index = parsed.remove("index").unwrap().as_string()?;
+    let key_name = parsed.remove("key").unwrap().as_string()?;
+
+    let key_rs = ctx.create_string(key_name.as_str());
+    let key = ctx.open_key_writable(&key_rs);
+    match key.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
+        Some(node) if node.index == index => {}
+        _ => return Err(no_node(&index, &key_name)),
+    }
+    // The unlink callback removes it from the graph.
+    key.delete()?;
+    ctx.notify_keyspace_event(NotifyEvent::GENERIC, "del", &key_rs);
 
     ctx.replicate_verbatim();
     Ok(1_usize.into())
 }
 
-fn delete_node_redis(ctx: &Context, node_name: &str) -> Result<(), RedisError> {
-    ctx.log_debug(format!("del key: {}", node_name).as_str());
-    let rkey = open_key_writable(ctx, node_name);
-    match rkey.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-        Some(_) => rkey.delete()?,
-        None => {
-            return Err(RedisError::String(format!(
-                "Node: {} does not exist",
-                node_name
-            )));
-        }
-    };
-
-    Ok(())
-}
-
-fn get_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    ctx.auto_memory();
-
-    let mut parsed = GET_NODE_CMD.with(|cmd| cmd.parse_args(args))?;
-
-    let index_suffix = parsed.remove("index").unwrap().as_string()?;
-    let node_suffix = parsed.remove("node").unwrap().as_string()?;
-
-    let node_name = node_key(&index_suffix, &node_suffix)?;
-
-    ctx.log_debug(format!("get key: {}", node_name).as_str());
-
-    let key = open_key(ctx, &node_name);
-
-    let value = key
-        .get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)?
-        .ok_or_else(|| err(format!("Node: {} does not exist", node_name)))?;
-
-    Ok(value.into())
-}
-
-fn write_node(ctx: &Context, key: &str, node: NodeRedis) -> RedisResult {
-    ctx.log_debug(format!("set key: {}", key).as_str());
-    let rkey = open_key_writable(ctx, key);
-
-    match rkey.get_value::<NodeRedis>(&HNSW_NODE_REDIS_TYPE)? {
-        Some(value) => {
-            value.data = node.data;
-            value.neighbors = node.neighbors;
-        }
-        None => {
-            rkey.set_value(&HNSW_NODE_REDIS_TYPE, node)?;
-        }
-    }
-    Ok(key.into())
-}
-
-fn search_knn(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    ctx.auto_memory();
-
+fn search_knn(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut parsed = SEARCH_CMD.with(|cmd| cmd.parse_args(args))?;
 
-    let index_suffix = parsed.remove("index").unwrap().as_string()?;
+    let index = parsed.remove("index").unwrap().as_string()?;
     let k = parsed.remove("k").unwrap().as_u64()? as usize;
-    let dataf64 = parsed.remove("query").unwrap().as_f64vec()?;
-    let data = dataf64.iter().map(|d| *d as f32).collect::<Vec<f32>>();
+    let data = parsed
+        .remove("query")
+        .unwrap()
+        .as_f64vec()?
+        .iter()
+        .map(|d| *d as f32)
+        .collect::<Vec<f32>>();
 
-    let index_name = index_key(&index_suffix)?;
-    let index = load_index(ctx, &index_name)?;
-    let index = index.try_read().map_err(|e| err(e.to_string()))?;
+    let indices = indices()?;
+    let graph = indices.get(&index).ok_or_else(|| no_index(&index))?;
+    let res = graph
+        .search_knn(&data, k)
+        .map_err(|e| err(e.error_string()))?;
 
-    ctx.log_debug(format!("Searching for {} nearest nodes in Index: {}", k, index_name).as_str());
-
-    match index.search_knn(&data, k) {
-        Ok(res) => {
-            let mut reply: Vec<RedisValue> = Vec::new();
-            reply.push(res.len().into());
-            for r in &res {
-                let sr: SearchResultRedis = r.into();
-                reply.push(sr.into());
-            }
-            Ok(reply.into())
-        }
-        Err(e) => Err(err(e.error_string())),
+    let mut reply: Vec<RedisValue> = Vec::with_capacity(res.len() + 1);
+    reply.push(res.len().into());
+    for r in &res {
+        let sr: SearchResultRedis = r.into();
+        reply.push(sr.into());
     }
+    Ok(reply.into())
 }
 
 // The Redis allocator only exists inside a running Redis server, so unit tests
@@ -531,16 +558,24 @@ redis_module! {
     version: 1,
     allocator: (Alloc, ALLOC),
     data_types: [
-        HNSW_INDEX_REDIS_TYPE,
         HNSW_NODE_REDIS_TYPE,
     ],
+    init: init,
+    // Index-level commands are keyless: they act on the shard they are sent
+    // to. Node commands declare the node's key (argv[2]) so Redis Cluster
+    // routes them to the shard that owns it.
     commands: [
-        ["hnsw.new", new_index, "write deny-oom", 1, 1, 1, ""],
-        ["hnsw.get", get_index, "readonly", 1, 1, 1, ""],
-        ["hnsw.del", delete_index, "write", 1, 1, 1, ""],
-        ["hnsw.search", search_knn, "readonly", 1, 1, 1, ""],
-        ["hnsw.node.add", add_node, "write deny-oom", 1, 1, 1, ""],
-        ["hnsw.node.get", get_node, "readonly", 1, 1, 1, ""],
-        ["hnsw.node.del", delete_node, "write", 1, 1, 1, ""],
+        ["hnsw.new", new_index, "write deny-oom", 0, 0, 0, ""],
+        ["hnsw.get", get_index, "readonly", 0, 0, 0, ""],
+        ["hnsw.del", delete_index, "write", 0, 0, 0, ""],
+        ["hnsw.search", search_knn, "readonly", 0, 0, 0, ""],
+        ["hnsw.node.add", add_node, "write deny-oom", 2, 2, 1, ""],
+        ["hnsw.node.get", get_node, "readonly", 2, 2, 1, ""],
+        ["hnsw.node.del", delete_node, "write", 2, 2, 1, ""],
+    ],
+    // Keys arriving by any route: our own writes (MODULE), RESTORE / RENAME
+    // (GENERIC) and RDB load (LOADED).
+    event_handlers: [
+        [@GENERIC @MODULE @LOADED: on_key_event],
     ],
 }
