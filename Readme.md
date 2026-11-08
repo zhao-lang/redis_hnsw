@@ -1,4 +1,4 @@
-[![licence](https://img.shields.io/github/license/zhao-lang/redis_hnsw.svg)](https://github.com/zhao-lang/redis_hnsw/blob/master/LICENSE)
+[![licence](https://img.shields.io/github/license/zhao-lang/redis_hnsw.svg)](https://github.com/zhao-lang/redis_hnsw/blob/main/LICENSE)
 [![release](https://img.shields.io/github/v/release/zhao-lang/redis_hnsw.svg)](https://github.com/zhao-lang/redis_hnsw/releases/latest)
 [![rust](https://github.com/zhao-lang/redis_hnsw/workflows/Rust/badge.svg)](https://github.com/zhao-lang/redis_hnsw/actions?query=workflow%3ARust)
 
