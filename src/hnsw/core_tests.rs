@@ -79,3 +79,12 @@ fn hnsw_test() {
         assert_eq!(sc, 1);
     }
 }
+
+#[test]
+fn error_string_is_plain_message() {
+    assert_eq!(HNSWError::from("static msg").error_string(), "static msg");
+    assert_eq!(
+        HNSWError::from(String::from("owned msg")).error_string(),
+        "owned msg"
+    );
+}

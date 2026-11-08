@@ -48,7 +48,10 @@ impl From<String> for HNSWError {
 
 impl HNSWError {
     pub fn error_string(&self) -> String {
-        format!("{:?}", self)
+        match self {
+            HNSWError::Str(s) => (*s).to_owned(),
+            HNSWError::String(s) => s.clone(),
+        }
     }
 }
 
@@ -410,7 +413,7 @@ where
         }
 
         if self.nodes.contains_key(name) {
-            return Err(format!("Node: {:?} already exists", name).into());
+            return Err(format!("Node: {} already exists", name).into());
         }
 
         self.insert(name, data, update_fn)
@@ -423,7 +426,7 @@ where
     ) -> Result<(), HNSWError> {
         let node = match self.nodes.remove(name) {
             Some(node) => node,
-            None => return Err(format!("Node: {:?} does not exist", name).into()),
+            None => return Err(format!("Node: {} does not exist", name).into()),
         };
         // self.nodes.shrink_to_fit();
         self.node_count -= 1;
