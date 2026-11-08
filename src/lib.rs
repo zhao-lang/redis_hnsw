@@ -16,6 +16,20 @@ use types::*;
 
 static PREFIX: &str = "hnsw";
 
+/// Key holding the index. The index name is a hash tag, so the index and all
+/// of its nodes live in one cluster slot: the slot of the bare index name,
+/// which is what the commands declare as their key (argv[1]).
+fn index_key(index: &str) -> Result<String, RedisError> {
+    if index.contains(['{', '}']) {
+        return Err(err("Index name must not contain '{' or '}'"));
+    }
+    Ok(format!("{}:{{{}}}", PREFIX, index))
+}
+
+fn node_key(index: &str, node: &str) -> Result<String, RedisError> {
+    Ok(format!("{}:{}", index_key(index)?, node))
+}
+
 fn err(msg: impl Into<String>) -> RedisError {
     RedisError::String(msg.into())
 }
@@ -134,7 +148,7 @@ fn new_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut parsed = NEW_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
-    let index_name = format!("{}.{}", PREFIX, name_suffix);
+    let index_name = index_key(&name_suffix)?;
     let data_dim = parsed.remove("dim").unwrap().as_u64()? as usize;
     let m = parsed.remove("m").unwrap().as_u64()? as usize;
     let ef_construction = parsed.remove("efcon").unwrap().as_u64()? as usize;
@@ -171,6 +185,7 @@ fn new_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
         }
     }
 
+    ctx.replicate_verbatim();
     Ok("OK".into())
 }
 
@@ -180,7 +195,7 @@ fn get_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut parsed = GET_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
-    let index_name = format!("{}.{}", PREFIX, name_suffix);
+    let index_name = index_key(&name_suffix)?;
 
     let index = load_index(ctx, &index_name)?;
     let index = index.try_read().map_err(|e| err(e.to_string()))?;
@@ -199,7 +214,7 @@ fn delete_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut parsed = DEL_INDEX_CMD.with(|cmd| cmd.parse_args(args))?;
 
     let name_suffix = parsed.remove("name").unwrap().as_string()?;
-    let index_name = format!("{}.{}", PREFIX, name_suffix);
+    let index_name = index_key(&name_suffix)?;
 
     // get index from global hashmap
     load_index(ctx, &index_name)?;
@@ -227,6 +242,7 @@ fn delete_index(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
         }
     };
 
+    ctx.replicate_verbatim();
     Ok(1_usize.into())
 }
 
@@ -345,8 +361,8 @@ fn add_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let node_suffix = parsed.remove("node").unwrap().as_string()?;
 
-    let index_name = format!("{}.{}", PREFIX, index_suffix);
-    let node_name = format!("{}.{}.{}", PREFIX, index_suffix, node_suffix);
+    let index_name = index_key(&index_suffix)?;
+    let node_name = node_key(&index_suffix, &node_suffix)?;
 
     let dataf64 = parsed.remove("data").unwrap().as_f64vec()?;
     let data = dataf64.iter().map(|d| *d as f32).collect::<Vec<f32>>();
@@ -370,6 +386,7 @@ fn add_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     // update index in redis
     update_index(ctx, &index_name, &index)?;
 
+    ctx.replicate_verbatim();
     Ok("OK".into())
 }
 
@@ -381,8 +398,8 @@ fn delete_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let node_suffix = parsed.remove("node").unwrap().as_string()?;
 
-    let index_name = format!("{}.{}", PREFIX, index_suffix);
-    let node_name = format!("{}.{}.{}", PREFIX, index_suffix, node_suffix);
+    let index_name = index_key(&index_suffix)?;
+    let node_name = node_key(&index_suffix, &node_suffix)?;
 
     let index = load_index(ctx, &index_name)?;
     let mut index = index.try_write().map_err(|e| err(e.to_string()))?;
@@ -411,6 +428,7 @@ fn delete_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     // update index in redis
     update_index(ctx, &index_name, &index)?;
 
+    ctx.replicate_verbatim();
     Ok(1_usize.into())
 }
 
@@ -438,7 +456,7 @@ fn get_node(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let index_suffix = parsed.remove("index").unwrap().as_string()?;
     let node_suffix = parsed.remove("node").unwrap().as_string()?;
 
-    let node_name = format!("{}.{}.{}", PREFIX, index_suffix, node_suffix);
+    let node_name = node_key(&index_suffix, &node_suffix)?;
 
     ctx.log_debug(format!("get key: {}", node_name).as_str());
 
@@ -477,7 +495,7 @@ fn search_knn(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let dataf64 = parsed.remove("query").unwrap().as_f64vec()?;
     let data = dataf64.iter().map(|d| *d as f32).collect::<Vec<f32>>();
 
-    let index_name = format!("{}.{}", PREFIX, index_suffix);
+    let index_name = index_key(&index_suffix)?;
     let index = load_index(ctx, &index_name)?;
     let index = index.try_read().map_err(|e| err(e.to_string()))?;
 
@@ -517,12 +535,12 @@ redis_module! {
         HNSW_NODE_REDIS_TYPE,
     ],
     commands: [
-        ["hnsw.new", new_index, "write", 0, 0, 0, ""],
-        ["hnsw.get", get_index, "readonly", 0, 0, 0, ""],
-        ["hnsw.del", delete_index, "write", 0, 0, 0, ""],
-        ["hnsw.search", search_knn, "readonly", 0, 0, 0, ""],
-        ["hnsw.node.add", add_node, "write", 0, 0, 0, ""],
-        ["hnsw.node.get", get_node, "readonly", 0, 0, 0, ""],
-        ["hnsw.node.del", delete_node, "write", 0, 0, 0, ""],
+        ["hnsw.new", new_index, "write deny-oom", 1, 1, 1, ""],
+        ["hnsw.get", get_index, "readonly", 1, 1, 1, ""],
+        ["hnsw.del", delete_index, "write", 1, 1, 1, ""],
+        ["hnsw.search", search_knn, "readonly", 1, 1, 1, ""],
+        ["hnsw.node.add", add_node, "write deny-oom", 1, 1, 1, ""],
+        ["hnsw.node.get", get_node, "readonly", 1, 1, 1, ""],
+        ["hnsw.node.del", delete_node, "write", 1, 1, 1, ""],
     ],
 }
