@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install stable toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -38,7 +38,7 @@ jobs:
       run: cargo build --release --verbose
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: build-release
         path: target/release/libredis_hnsw.so
