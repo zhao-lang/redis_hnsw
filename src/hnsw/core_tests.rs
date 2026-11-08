@@ -58,9 +58,9 @@ fn hnsw_test() {
         let node = index.nodes.get(&node_name).unwrap().clone();
         index.delete_node(&node_name, mock_fn).unwrap();
         assert_eq!(index.node_count, n - i - 1);
-        assert_eq!(index.nodes.get(&node_name).is_none(), true);
+        assert!(!index.nodes.contains_key(&node_name));
         for l in &index.layers {
-            assert_eq!(l.contains(&node.downgrade()), false);
+            assert!(!l.contains(&node.downgrade()));
         }
         for n in index.nodes.values() {
             for l in &n.read().neighbors {

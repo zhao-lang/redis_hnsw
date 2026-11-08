@@ -5,7 +5,6 @@ pub use self::core::*;
 mod core_tests;
 
 pub mod metrics;
-pub use self::metrics::*;
 
 #[cfg(test)]
 mod metrics_tests;

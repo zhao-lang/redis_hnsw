@@ -26,7 +26,7 @@
 ## Getting Started
 <a id="markdown-getting-started" name="getting-started"></a>
 
-> :warning: **requires nightly rust**
+Requires stable Rust 1.88 or newer, plus libclang for building the Redis bindings (`sudo apt-get install libclang-dev` on Debian/Ubuntu).
 
 Build the module - `cargo build`
 

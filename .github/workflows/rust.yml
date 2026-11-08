@@ -6,48 +6,39 @@ on:
   pull_request:
     branches: [ master ]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
 
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Install latest nightly
-      uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@v4
+
+    - name: Install stable toolchain
+      uses: dtolnay/rust-toolchain@stable
       with:
-          toolchain: nightly
-          override: true
-          components: rustfmt, clippy
-    
+        components: rustfmt, clippy
+
+    - name: Install libclang (needed by redis-module bindgen)
+      run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
     - name: Run rustfmt
-      uses: actions-rs/cargo@v1
-      with:
-        command: fmt
-        args: --all -- --check
+      run: cargo fmt --all -- --check
 
     - name: Run clippy
-      uses: actions-rs/cargo@v1
-      with:
-        command: clippy
-        args: -- -D warnings
+      run: cargo clippy --all-targets -- -D warnings
 
     - name: Run tests
-      uses: actions-rs/cargo@v1
-      with:
-        command: test
-        args: --verbose
-    
+      run: cargo test --verbose
+
     - name: Build
-      uses: actions-rs/cargo@v1
-      with:
-        command: build
-        args: --release --verbose
+      run: cargo build --release --verbose
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v1.0.0
+      uses: actions/upload-artifact@v4
       with:
-        # Artifact name
         name: build-release
-        # Directory containing files to upload
         path: target/release/libredis_hnsw.so

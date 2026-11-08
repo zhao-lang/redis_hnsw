@@ -1,18 +1,25 @@
+// Node<T> hashes by its name, which never changes after creation, so using it
+// as a HashSet key is sound despite the RwLock inside.
+#![allow(clippy::mutable_key_type)]
+
 use super::metrics;
 
-use num::Float;
 use ordered_float::OrderedFloat;
-use owning_ref::{RefMutRefMut, RefRef, RwLockReadGuardRef, RwLockWriteGuardRefMut};
-use rand::prelude::*;
-use std::cell::RefCell;
-use std::cmp::{min, Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
+use rand::RngExt;
+use std::cell::{Ref, RefCell, RefMut};
+use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse, min};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::convert::From;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 // use std::thread;
+
+/// Floating point types usable in the index: full float math plus the total
+/// ordering `OrderedFloat` requires.
+pub trait Float: num_traits::Float + num_traits::float::FloatCore {}
+impl<F: num_traits::Float + num_traits::float::FloatCore> Float for F {}
 
 struct SelectParams {
     m: usize,
@@ -202,12 +209,12 @@ impl<T: Float> Node<T> {
         Node(Arc::new(RwLock::new(node)))
     }
 
-    pub fn read(&self) -> RwLockReadGuardRef<_Node<T>> {
-        RwLockReadGuardRef::new(self.0.try_read().unwrap())
+    pub fn read(&self) -> RwLockReadGuard<'_, _Node<T>> {
+        self.0.try_read().unwrap()
     }
 
-    pub fn write(&self) -> RwLockWriteGuardRefMut<_Node<T>> {
-        RwLockWriteGuardRefMut::new(self.0.try_write().unwrap())
+    pub fn write(&self) -> RwLockWriteGuard<'_, _Node<T>> {
+        self.0.try_write().unwrap()
     }
 
     fn push_levels(&self, level: usize, capacity: Option<usize>) {
@@ -258,12 +265,12 @@ where
         SimPair(Rc::new(RefCell::new(sp)))
     }
 
-    fn read(&self) -> RefRef<_SimPair<T, R>> {
-        RefRef::new(self.0.borrow())
+    fn read(&self) -> Ref<'_, _SimPair<T, R>> {
+        self.0.borrow()
     }
 
-    fn write(&mut self) -> RefMutRefMut<_SimPair<T, R>> {
-        RefMutRefMut::new(self.0.borrow_mut())
+    fn write(&mut self) -> RefMut<'_, _SimPair<T, R>> {
+        self.0.borrow_mut()
     }
 }
 
@@ -285,7 +292,7 @@ where
     R: Float,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.borrow().sim.partial_cmp(&other.0.borrow().sim)
+        Some(self.cmp(other))
     }
 }
 
@@ -315,7 +322,6 @@ pub struct Index<T: Float, R: Float> {
     pub layers: Vec<HashSet<NodeWeak<T>>>,      // distinct nodes in each layer
     pub nodes: HashMap<String, Node<T>>,        // hashmap of nodes
     pub enterpoint: Option<NodeWeak<T>>,        // enterpoint node
-    pub rng_: StdRng,                           // rng for level generation
 }
 
 impl<T: Float, R: Float> Index<T, R> {
@@ -341,7 +347,6 @@ impl<T: Float, R: Float> Index<T, R> {
             layers: Vec::new(),
             nodes: HashMap::new(),
             enterpoint: None,
-            rng_: StdRng::from_entropy(),
         }
     }
 }
@@ -404,7 +409,7 @@ where
             return Ok(());
         }
 
-        if self.nodes.get(name).is_some() {
+        if self.nodes.contains_key(name) {
             return Err(format!("Node: {:?} already exists", name).into());
         }
 
@@ -599,8 +604,8 @@ where
     }
 
     fn gen_random_level(&mut self) -> usize {
-        let dist = rand::distributions::Uniform::from(0_f64..1_f64);
-        let r: f64 = dist.sample(&mut self.rng_);
+        // random() is in [0, 1); flip to (0, 1] so ln() never sees 0.
+        let r: f64 = 1.0 - rand::rng().random::<f64>();
         (-r.ln() * self.level_mult) as usize
     }
 
@@ -802,8 +807,7 @@ where
         }
 
         // bidirectionally remove old connections
-        while !rmconn.is_empty() {
-            let rmpair = rmconn.pop().unwrap();
+        while let Some(rmpair) = rmconn.pop() {
             let rmpr = rmpair.read();
             node.rm_neighbor(level, &rmpr.node.downgrade());
             // if node to be removed is the ignored node then pass
@@ -882,9 +886,7 @@ where
             let cnr = cr.node.read();
             res.push(SearchResult::new(
                 cr.sim,
-                &((&cnr.name).split('.').collect::<Vec<&str>>())
-                    .last()
-                    .unwrap(),
+                (cnr.name.split('.').collect::<Vec<&str>>()).last().unwrap(),
                 &cnr.data,
             ));
         }
